@@ -1,12 +1,14 @@
 {
   "global": {
-    "tps": 100,
-    "max_inflight": 200000,
-    "pending_buf": 200000,
+    "tps": 1000,
+    "tps_ramp_percent": 10,
+    "tps_ramp_hold_seconds": 2
+    "max_inflight": 0,
+    "pending_buf": 1000,
     "request_timeout_seconds": 12,
     "max_retries": 2,
     "backoff_ms": 50,
-    "total_msg": 1000,
+    "total_msg": 0,
     "max_idle_per_host": 200,
     "idle_conn_seconds": 90,
     "metrics_addr": ":9091",

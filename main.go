@@ -10,7 +10,7 @@ import (
 	"io"
 
 	// "log" // Remove standard log package
-	"math"
+//	"math"
 	"net/http"
 	"net/http/pprof"
 	"os"
@@ -24,6 +24,7 @@ import (
 	"github.com/sirupsen/logrus" // Import logrus
 
 	"golang.org/x/net/http2"
+	"golang.org/x/time/rate"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -43,14 +44,16 @@ type API struct {
 type Config struct {
 	Global struct {
 		TPS            float64 `json:"tps"` // TPS per API (each API receives this rate)
+		TpsRampPercent     float64 `json:"tps_ramp_percent"` //
+		TpsRampHoldSeconds int     `json:"tps_ramp_hold_seconds"`
 		MaxInflight    int     `json:"max_inflight"`
 		PendingBuf     int     `json:"pending_buf"`
 		RequestTimeout int     `json:"request_timeout_seconds"`
 		MaxRetries     int     `json:"max_retries"`
 		BackoffMs      int     `json:"backoff_ms"`
 		MetricsAddr    string  `json:"metrics_addr"`
-		// Total number of messages to send across all APIs. If 0, scheduler runs indefinitely according to TPS.
-		TotalMsg       int `json:"total_msg"`
+		
+		TotalMsg       int `json:"total_msg"` // Total number of messages to send across all APIs. If 0, scheduler runs indefinitely according to TPS.
 		MaxIdlePerHost int `json:"max_idle_per_host"`
 		IdleConnSec    int `json:"idle_conn_seconds"`
 	} `json:"global"`
@@ -195,7 +198,7 @@ func main() {
 
 	stats := NewStats(cfg.APIs)
 	// Scheduler (global TPS)
-	go schedulerGlobal(ctx, cfg.Global.TPS, cfg.APIs, pending, cfg.Global.TotalMsg, closePending)
+	go scheduler(ctx, cfg.Global.TPS, cfg.APIs, pending, cfg.Global.TotalMsg, closePending)
 
 	// Dispatcher
 	go dispatcher(ctx, client, pending, sem, &inFlightWG, cfg, stats)
@@ -289,6 +292,12 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.Global.TPS <= 0 {
 		cfg.Global.TPS = 1000
 	}
+	
+	stepFraction := cfg.Global.TpsStepPercent / 100.0
+	if stepFraction <= 0 {
+		stepFraction = 0.10 // fallback to 10%
+	}
+	
 	if cfg.Global.MaxInflight <= 0 {
 		cfg.Global.MaxInflight = 1000
 	}
@@ -321,95 +330,59 @@ func loadConfig(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-func schedulerGlobal(
+
+
+func scheduler(
 	ctx context.Context,
-	totalTPS float64,
+	tps float64,
 	apis []API,
 	pending chan<- Job,
-	totalMsg int,
+	total int,
 	closePending func(),
 ) {
-	// If no APIs, nothing to do
-	if len(apis) == 0 {
-		if closePending != nil {
-			closePending()
-		}
-		return
-	}
 
-	ticker := time.NewTicker(1 * time.Millisecond)
-	defer ticker.Stop()
+	totaltps := int(tps) * int(len(apis))
+	limiter := rate.NewLimiter(rate.Limit(totaltps), int(totaltps)) // tps burst allowed
 
-	// Global TPS across all APIs
-	// Example: TPS = 100 -> 100 / 1000 = 0.1 requests per millisecond
-	rate := totalTPS / 1000.0
+	totalMessages := total * len(apis)
+	apiIdx := 0
+	sent := 0
 
-	var acc float64   // accumulator for fractional requests
-	var sent int      // total messages sent so far
-	apiIdx := 0       // round-robin index over APIs
-
+	logrus.Infof("Starting scheduler: TPS=%.2f, APIs=%d, total messages=%d",
+		tps, len(apis), totalMessages)
 	for {
-		select {
-		case <-ctx.Done():
+		// Stop sending when total reached
+		if totalMessages > 0 && sent >= totalMessages {
+			logrus.Infof("[SCHED] Completed total=%d messages", total)
+			closePending()
 			return
+		}
 
-		case <-ticker.C:
-			// If totalMsg > 0, stop once we reach it
-			if totalMsg > 0 && sent >= totalMsg {
-				logrus.Infof("[SCHED] reached total messages=%d, stopping scheduler", totalMsg)
-				if closePending != nil {
-					closePending()
-				}
-				return
-			}
+		// Wait based on TPS rate
+		if err := limiter.Wait(ctx); err != nil {
+			logrus.Warn("scheduler canceled:", err)
+			return
+		}
 
-			// If TPS not set or zero, don't schedule anything
-			if totalTPS <= 0 {
-				continue
-			}
+		// Pick next API round-robin
+		api := apis[apiIdx]
+		apiIdx = (apiIdx + 1) % len(apis)
 
-			// Add per-ms rate into accumulator
-			acc += rate
+		seq := atomic.AddInt64(&globalSeq, 1)
 
-			// How many whole requests can we emit now?
-			toEmit := int(math.Floor(acc))
-			if toEmit <= 0 {
-				continue
-			}
-			acc -= float64(toEmit)
-
-			for i := 0; i < toEmit; i++ {
-				// Check again so we don't exceed totalMsg
-				if totalMsg > 0 && sent >= totalMsg {
-					logrus.Infof("[SCHED] reached total messages=%d, stopping scheduler", totalMsg)
-					if closePending != nil {
-						closePending()
-					}
-					return
-				}
-
-				api := apis[apiIdx]
-				apiIdx = (apiIdx + 1) % len(apis)
-
-				seq := atomic.AddInt64(&globalSeq, 1)
-				job := Job{
-					API: api,
-					Seq: seq,
-				}
-
-				select {
-				case pending <- job:
-					sent++
-					logrus.Debugf("[SCHED] queued api=%s seq=%d sent=%d", api.Name, seq, sent)
-				case <-ctx.Done():
-					return
-				}
-			}
+		select {
+		case pending <- Job{API: api, Seq: seq}:
+			sent++
+			logrus.Debugf("[SCHED] queued api=%s seq=%d sent=%d/%d",
+				api.Name, seq, sent, total)
+		case <-ctx.Done():
+			logrus.Warn("scheduler stopped (context done)")
+			return
 		}
 	}
 }
 
-/*func schedulerGlobal(ctx context.Context, totalTPS float64, apis []API, pending chan<- Job, totalRounds int, closePending func()) {
+/*func scheduler(ctx context.Context, totalTPS float64, apis []API, pending chan<- Job, totalRounds int, closePending func()) {
 	ticker := time.NewTicker(1 * time.Millisecond)
 	defer ticker.Stop()
 

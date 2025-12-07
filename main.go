@@ -298,8 +298,8 @@ func loadConfig(path string) (*Config, error) {
 		stepFraction = 0.10 // default to 10% if 0 or negative
 	}
 
-	if TpsRampHoldSeconds <= 0 {
-		TpsRampHoldSeconds = 1 // default to 1 seconds
+	if cfg.Global.TpsRampHoldSeconds <= 0 {
+		cfg.Global.TpsRampHoldSeconds = 1 // default to 1 seconds
 	}	
 	
 	if cfg.Global.MaxInflight <= 0 {
@@ -351,7 +351,7 @@ func scheduler(
 		return
 	}
 
-	maxTPS := cfg.Global.TPS
+	maxTPS := cfg.Global.TPS * float64(len(apis))
 	if maxTPS <= 0 {
 		logrus.Error("[SCHED] tps must be > 0 — exiting scheduler")
 		if closePending != nil {
@@ -361,7 +361,7 @@ func scheduler(
 	}
 
 	// total_msg is PER API → total = total_msg * number_of_APIs
-	totalPerAPI := cfg.Global.TotalMsg
+	totalPerAPI := cfg.Global.TotalMsg 
 	totalMessages := 0
 	if totalPerAPI > 0 {
 		totalMessages = totalPerAPI * len(apis)

@@ -7,7 +7,7 @@ import (
 
 // APIMetric holds counters for a single API.
 type APIMetric struct {
-	Sent          uint64
+	TotalSent     uint64
 	TotalResponse uint64
 	Success       uint64 // 2xx
 	Redirect      uint64 // 3xx
@@ -20,16 +20,20 @@ type APIMetric struct {
 // Stats tracks key performance metrics.
 type Stats struct {
 	APIMetrics map[string]*APIMetric
-	mu         sync.RWMutex
+	// Order preserves the API names in the same order as provided by config.
+	Order []string
+	mu    sync.RWMutex
 }
 
 // NewStats creates a new Stats object.
 func NewStats(apis []API) *Stats {
 	s := &Stats{
 		APIMetrics: make(map[string]*APIMetric),
+		Order:      make([]string, 0, len(apis)),
 	}
 	for _, api := range apis {
 		s.APIMetrics[api.Name] = &APIMetric{}
+		s.Order = append(s.Order, api.Name)
 	}
 	return s
 }
@@ -39,7 +43,7 @@ func (s *Stats) IncSent(apiName string) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if m, ok := s.APIMetrics[apiName]; ok {
-		atomic.AddUint64(&m.Sent, 1)
+		atomic.AddUint64(&m.TotalSent, 1)
 	}
 }
 
@@ -107,7 +111,7 @@ func (s *Stats) GetAPIMetrics() map[string]APIMetric {
 	for name, m := range s.APIMetrics {
 		m.mu.RLock()
 		metrics[name] = APIMetric{
-			Sent:          atomic.LoadUint64(&m.Sent),
+			TotalSent:          atomic.LoadUint64(&m.TotalSent),
 			TotalResponse: atomic.LoadUint64(&m.TotalResponse),
 			Success:       atomic.LoadUint64(&m.Success),
 			Redirect:      atomic.LoadUint64(&m.Redirect),
@@ -118,4 +122,36 @@ func (s *Stats) GetAPIMetrics() map[string]APIMetric {
 		m.mu.RUnlock()
 	}
 	return metrics
+}
+
+// APIMetricEntry is a snapshot of an API metric with its name, preserving configured order.
+type APIMetricEntry struct {
+	Name   string
+	Metric APIMetric
+}
+
+// GetAPIMetricsOrdered returns a slice of metric snapshots in the same order
+// as the APIs were provided to NewStats. Use this when stable ordering is
+// required for display/UI.
+func (s *Stats) GetAPIMetricsOrdered() []APIMetricEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]APIMetricEntry, 0, len(s.Order))
+	for _, name := range s.Order {
+		if m, ok := s.APIMetrics[name]; ok {
+			m.mu.RLock()
+			snap := APIMetric{
+				TotalSent:     atomic.LoadUint64(&m.TotalSent),
+				TotalResponse: atomic.LoadUint64(&m.TotalResponse),
+				Success:       atomic.LoadUint64(&m.Success),
+				Redirect:      atomic.LoadUint64(&m.Redirect),
+				ClientError:   atomic.LoadUint64(&m.ClientError),
+				ServerError:   atomic.LoadUint64(&m.ServerError),
+				TotalLatency:  m.TotalLatency,
+			}
+			m.mu.RUnlock()
+			out = append(out, APIMetricEntry{Name: name, Metric: snap})
+		}
+	}
+	return out
 }

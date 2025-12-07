@@ -6,12 +6,12 @@
     "request_timeout_seconds": 12,
     "max_retries": 2,
     "backoff_ms": 50,
-    "metrics_addr": ":9091",
-    "total_msg": 10000,
+    "total_msg": 100000,
     "max_idle_per_host": 200,
-    "idle_conn_seconds": 90
+    "idle_conn_seconds": 90,
+    "metrics_addr": ":9091",
+    "log_level": "info"
   },
-
   "apis": [
     {
       "name": "api1",
@@ -43,4 +43,3 @@
     }
   ]
 }
-

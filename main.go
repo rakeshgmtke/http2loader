@@ -226,37 +226,37 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-					// Use ordered snapshot to compute TPS and average latency in configured order.
-					ordered := stats.GetAPIMetricsOrdered()
-					currentTime := time.Now()
-					tps := make(map[string]float64)
-					avgLatency := make(map[string]float64)
+				// Use ordered snapshot to compute TPS and average latency in configured order.
+				ordered := stats.GetAPIMetricsOrdered()
+				currentTime := time.Now()
+				tps := make(map[string]float64)
+				avgLatency := make(map[string]float64)
 
-					if lastMetrics != nil {
-						duration := currentTime.Sub(lastTime).Seconds()
-						for _, entry := range ordered {
-							name := entry.Name
-							m := entry.Metric
-							lastM, ok := lastMetrics[name]
-							if !ok {
-								continue
-							}
-							tps[name] = float64(m.TotalResponse-lastM.TotalResponse) / duration
-							if m.TotalResponse-lastM.TotalResponse > 0 {
-								avgLatency[name] = (m.TotalLatency - lastM.TotalLatency) / float64(m.TotalResponse-lastM.TotalResponse)
-							}
+				if lastMetrics != nil {
+					duration := currentTime.Sub(lastTime).Seconds()
+					for _, entry := range ordered {
+						name := entry.Name
+						m := entry.Metric
+						lastM, ok := lastMetrics[name]
+						if !ok {
+							continue
+						}
+						tps[name] = float64(m.TotalResponse-lastM.TotalResponse) / duration
+						if m.TotalResponse-lastM.TotalResponse > 0 {
+							avgLatency[name] = (m.TotalLatency - lastM.TotalLatency) / float64(m.TotalResponse-lastM.TotalResponse)
 						}
 					}
+				}
 
-					printMetrics(stats, len(pending), tps, avgLatency)
+				printMetrics(stats, len(pending), tps, avgLatency)
 
-					// Convert ordered snapshot into map for next iteration's diffing.
-					currentMetrics := make(map[string]APIMetric, len(ordered))
-					for _, entry := range ordered {
-						currentMetrics[entry.Name] = entry.Metric
-					}
-					lastMetrics = currentMetrics
-					lastTime = currentTime
+				// Convert ordered snapshot into map for next iteration's diffing.
+				currentMetrics := make(map[string]APIMetric, len(ordered))
+				for _, entry := range ordered {
+					currentMetrics[entry.Name] = entry.Metric
+				}
+				lastMetrics = currentMetrics
+				lastTime = currentTime
 			}
 		}
 	}()
@@ -511,7 +511,7 @@ func startSend(ctx context.Context, job Job, client *http.Client, sem chan struc
 		req, err := http.NewRequestWithContext(rctx, j.API.Method, j.API.URL, bytes.NewReader([]byte(j.API.Body)))
 		if err != nil {
 			metricFailed.WithLabelValues(j.API.Name, "client_error").Inc() // Label for request creation error
-			stats.IncClientError(j.API.Name) // Treat request creation errors as client errors
+			stats.IncClientError(j.API.Name)                               // Treat request creation errors as client errors
 			logrus.Errorf("[ERR] %s seq=%d err=%v\n", j.API.Name, j.Seq, err)
 			return
 		}
@@ -522,10 +522,11 @@ func startSend(ctx context.Context, job Job, client *http.Client, sem chan struc
 
 		start := time.Now()
 		resp, err := client.Do(req)
+		stats.IncTotalSent(j.API.Name)
 		lat := time.Since(start).Seconds()
 		if err != nil {
 			metricFailed.WithLabelValues(j.API.Name, "transport_error").Inc() // Label for transport error
-			stats.IncClientError(j.API.Name) // Treat transport errors as client errors
+			stats.IncClientError(j.API.Name)                                  // Treat transport errors as client errors
 			logrus.Errorf("[ERR] %s seq=%d err=%v\n", j.API.Name, j.Seq, err)
 			return
 		}

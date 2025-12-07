@@ -9,10 +9,10 @@ import (
 type APIMetric struct {
 	TotalSent     uint64
 	TotalResponse uint64
-	Success       uint64 // 2xx
-	Redirect      uint64 // 3xx
-	ClientError   uint64 // 4xx
-	ServerError   uint64 // 5xx
+	Success       uint64  // 2xx
+	Redirect      uint64  // 3xx
+	ClientError   uint64  // 4xx
+	ServerError   uint64  // 5xx
 	TotalLatency  float64 // in seconds
 	mu            sync.RWMutex
 }
@@ -94,6 +94,15 @@ func (s *Stats) AddLatency(apiName string, latency float64) {
 	}
 }
 
+// IncTotalSent increments the total response counter for a given API.
+func (s *Stats) IncTotalSent(apiName string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if m, ok := s.APIMetrics[apiName]; ok {
+		atomic.AddUint64(&m.TotalSent, 1)
+	}
+}
+
 // IncTotalResponse increments the total response counter for a given API.
 func (s *Stats) IncTotalResponse(apiName string) {
 	s.mu.RLock()
@@ -111,7 +120,7 @@ func (s *Stats) GetAPIMetrics() map[string]APIMetric {
 	for name, m := range s.APIMetrics {
 		m.mu.RLock()
 		metrics[name] = APIMetric{
-			TotalSent:          atomic.LoadUint64(&m.TotalSent),
+			TotalSent:     atomic.LoadUint64(&m.TotalSent),
 			TotalResponse: atomic.LoadUint64(&m.TotalResponse),
 			Success:       atomic.LoadUint64(&m.Success),
 			Redirect:      atomic.LoadUint64(&m.Redirect),

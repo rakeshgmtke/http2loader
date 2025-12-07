@@ -1,0 +1,41 @@
+{
+  "global": {
+    "tps": 10,
+    "max_inflight": 2000,
+    "pending_buf": 20000,
+    "request_timeout_seconds": 12,
+    "max_retries": 2,
+    "backoff_ms": 50,
+    "metrics_addr": ":9091",
+    "max_idle_per_host": 200,
+    "idle_conn_seconds": 90
+  },
+
+  "apis": [
+    {
+      "name": "api1",
+      "url": "https://example.com:3000/api/1",
+      "method": "POST",
+      "body": "{\"a\":1}"
+    },
+    {
+      "name": "api2",
+      "url": "https://example.com:3000/api/2",
+      "method": "POST",
+      "body": "{\"a\":2}"
+    },
+    {
+      "name": "api3",
+      "url": "https://example.com:3000/api/3",
+      "method": "POST",
+      "body": "{\"a\":3}"
+    },
+    {
+      "name": "api4",
+      "url": "https://example.com:3000/api/4",
+      "method": "POST",
+      "body": "{\"a\":4}"
+    }
+  ]
+}
+

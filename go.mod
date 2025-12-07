@@ -1,4 +1,4 @@
-module github.com/yourusername/high_performance_httpclient
+module github.com/yourusername/http2loader
 
 go 1.24.1
 

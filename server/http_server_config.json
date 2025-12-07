@@ -1,0 +1,40 @@
+{
+    "routes": [
+        {
+            "path": "/api/1$",
+            "method": "POST",
+            "status": 200,
+            "delay": 0,
+            "includeRspBodyfromReqBody": false,
+            "body": {"message": "API 1 response", "status": "ok"},
+            "headers": {"Content-Type": "application/json"}
+        },
+        {
+            "path": "/api/2$",
+            "method": "POST",
+            "status": 200,
+            "delay": 0,
+            "includeRspBodyfromReqBody": false,
+            "body": {"message": "API 2 response", "status": "ok"},
+            "headers": {"Content-Type": "application/json"}
+        },
+        {
+            "path": "/api/3$",
+            "method": "POST",
+            "status": 200,
+            "delay": 0,
+            "includeRspBodyfromReqBody": false,
+            "body": {"message": "API 3 response", "status": "ok"},
+            "headers": {"Content-Type": "application/json"}
+        },
+        {
+            "path": "/api/4$",
+            "method": "POST",
+            "status": 200,
+            "delay": 0,
+            "includeRspBodyfromReqBody": false,
+            "body": {"message": "API 4 response", "status": "ok"},
+            "headers": {"Content-Type": "application/json"}
+        }
+    ]
+}

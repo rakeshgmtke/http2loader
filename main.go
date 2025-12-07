@@ -10,8 +10,8 @@ import (
 	"io"
 	"log"
 	"math"
-	"math/rand"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"sync"
@@ -31,20 +31,24 @@ type API struct {
 	URL    string `json:"url"`
 	Method string `json:"method"`
 	Body   string `json:"body"`
+	// Delay in milliseconds to wait before dispatching this API's request.
+	DelayMs int `json:"delay_ms"`
 }
 
 // Config defines configuration fields
 type Config struct {
 	Global struct {
-		TPS            float64 `json:"tps"` // TOTAL TPS across ALL APIs
+		TPS            float64 `json:"tps"` // TPS per API (each API receives this rate)
 		MaxInflight    int     `json:"max_inflight"`
 		PendingBuf     int     `json:"pending_buf"`
 		RequestTimeout int     `json:"request_timeout_seconds"`
 		MaxRetries     int     `json:"max_retries"`
 		BackoffMs      int     `json:"backoff_ms"`
 		MetricsAddr    string  `json:"metrics_addr"`
-		MaxIdlePerHost int     `json:"max_idle_per_host"`
-		IdleConnSec    int     `json:"idle_conn_seconds"`
+		// Total number of messages to send across all APIs. If 0, scheduler runs indefinitely according to TPS.
+		TotalMsg       int `json:"total_msg"`
+		MaxIdlePerHost int `json:"max_idle_per_host"`
+		IdleConnSec    int `json:"idle_conn_seconds"`
 	} `json:"global"`
 	APIs []API `json:"apis"`
 }
@@ -103,22 +107,38 @@ func main() {
 	pending := make(chan Job, cfg.Global.PendingBuf)
 	sem := make(chan struct{}, cfg.Global.MaxInflight)
 	var inFlightWG sync.WaitGroup
+	var pendingCloser sync.Once
+	closePending := func() {
+		pendingCloser.Do(func() { close(pending) })
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go waitForSig(cancel)
 
-	// Start metrics server
+	// Start metrics server with pprof
 	go func() {
-		http.Handle("/metrics", promhttp.Handler())
-		log.Printf("Metrics at %s/metrics", cfg.Global.MetricsAddr)
-		if err := http.ListenAndServe(cfg.Global.MetricsAddr, nil); err != nil {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		// Register pprof handlers properly using http package
+		mux.HandleFunc("/debug/pprof/", http.HandlerFunc(pprof.Index))
+		mux.HandleFunc("/debug/pprof/cmdline", http.HandlerFunc(pprof.Cmdline))
+		mux.HandleFunc("/debug/pprof/profile", http.HandlerFunc(pprof.Profile))
+		mux.HandleFunc("/debug/pprof/symbol", http.HandlerFunc(pprof.Symbol))
+		mux.HandleFunc("/debug/pprof/trace", http.HandlerFunc(pprof.Trace))
+		mux.Handle("/debug/pprof/heap", pprof.Handler("heap"))
+		mux.Handle("/debug/pprof/goroutine", pprof.Handler("goroutine"))
+		mux.Handle("/debug/pprof/threadcreate", pprof.Handler("threadcreate"))
+		mux.Handle("/debug/pprof/block", pprof.Handler("block"))
+		mux.Handle("/debug/pprof/mutex", pprof.Handler("mutex"))
+		log.Printf("Metrics at %s/metrics, pprof at %s/debug/pprof/", cfg.Global.MetricsAddr, cfg.Global.MetricsAddr)
+		if err := http.ListenAndServe(cfg.Global.MetricsAddr, mux); err != nil {
 			log.Printf("Metrics server error: %v", err)
 		}
 	}()
 
 	// Scheduler (global TPS)
-	go schedulerGlobal(ctx, cfg.Global.TPS, cfg.APIs, pending)
+	go schedulerGlobal(ctx, cfg.Global.TPS, cfg.APIs, pending, cfg.Global.TotalMsg, closePending)
 
 	// Dispatcher
 	go dispatcher(ctx, client, pending, sem, &inFlightWG, cfg)
@@ -140,7 +160,8 @@ func main() {
 	<-ctx.Done()
 	log.Println("Shutdown requested — draining pending queue")
 
-	close(pending)
+	// Ensure pending is closed (scheduler may already have closed it)
+	closePending()
 	inFlightWG.Wait()
 
 	if tr, ok := client.Transport.(*http.Transport); ok {
@@ -189,23 +210,108 @@ func loadConfig(path string) (*Config, error) {
 		cfg.Global.IdleConnSec = 90
 	}
 
+	if cfg.Global.TotalMsg < 0 {
+		cfg.Global.TotalMsg = 0
+	}
+
 	return &cfg, nil
 }
 
-func schedulerGlobal(ctx context.Context, totalTPS float64, apis []API, pending chan<- Job) {
+func schedulerGlobal(ctx context.Context, totalTPS float64, apis []API, pending chan<- Job, totalRounds int, closePending func()) {
 	ticker := time.NewTicker(1 * time.Millisecond)
 	defer ticker.Stop()
+
+	// Queue of delayed jobs (API, sequence, readyTime)
+	type delayedJob struct {
+		api   API
+		seq   int64
+		ready time.Time
+	}
+	delayedQueue := make([]delayedJob, 0, 100)
 
 	acc := 0.0
 	apiIdx := 0
 	count := len(apis)
+	var emitted int64
+	var totalToEmit int64
+	if totalRounds > 0 {
+		totalToEmit = int64(totalRounds) * int64(count)
+	}
+
+	// Emit an initial burst: round(TPS) jobs per second per API (burst across all APIs)
+	if totalTPS > 0 && count > 0 {
+		burstPerSec := int(math.Round(totalTPS))
+		burst := burstPerSec * count
+		for i := 0; i < burst; i++ {
+			api := apis[i%count]
+			seq := atomic.AddInt64(&globalSeq, 1)
+			if api.DelayMs > 0 {
+				delayedQueue = append(delayedQueue, delayedJob{api, seq, time.Now().Add(time.Duration(api.DelayMs) * time.Millisecond)})
+				continue
+			}
+			job := Job{API: api, Seq: seq}
+
+			select {
+			case pending <- job:
+				if totalRounds > 0 {
+					log.Printf("[SCHED] queued api=%s seq=%d emitted=%d/%d", api.Name, seq, emitted+1, totalToEmit)
+				} else {
+					log.Printf("[SCHED] queued api=%s seq=%d", api.Name, seq)
+				}
+				if totalRounds > 0 {
+					emitted++
+					if emitted >= totalToEmit {
+						log.Printf("[SCHED] reached total rounds=%d (total messages=%d), stopping scheduler", totalRounds, totalToEmit)
+						if closePending != nil {
+							closePending()
+						}
+						return
+					}
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			acc += totalTPS / 1000.0
+			now := time.Now()
+
+			// Process delayed queue: emit jobs whose delay has expired
+			var remaining []delayedJob
+			for _, dj := range delayedQueue {
+				if now.After(dj.ready) {
+					job := Job{API: dj.api, Seq: dj.seq}
+					select {
+					case pending <- job:
+						if totalRounds > 0 {
+							log.Printf("[SCHED] queued api=%s seq=%d emitted=%d/%d (delayed)", dj.api.Name, dj.seq, emitted+1, totalToEmit)
+						}
+						if totalRounds > 0 {
+							emitted++
+							if emitted >= totalToEmit {
+								log.Printf("[SCHED] reached total rounds=%d (total messages=%d), stopping scheduler", totalRounds, totalToEmit)
+								if closePending != nil {
+									closePending()
+								}
+								return
+							}
+						}
+					case <-ctx.Done():
+						return
+					}
+				} else {
+					remaining = append(remaining, dj)
+				}
+			}
+			delayedQueue = remaining
+
+			// totalTPS is now interpreted as per-API TPS, scale by number of APIs
+			acc += (totalTPS * float64(count)) / 1000.0
 			toEmit := int(math.Floor(acc))
 			if toEmit <= 0 {
 				continue
@@ -217,10 +323,32 @@ func schedulerGlobal(ctx context.Context, totalTPS float64, apis []API, pending 
 				apiIdx = (apiIdx + 1) % count
 
 				seq := atomic.AddInt64(&globalSeq, 1)
+
+				// Queue delayed jobs separately
+				if api.DelayMs > 0 {
+					delayedQueue = append(delayedQueue, delayedJob{api, seq, now.Add(time.Duration(api.DelayMs) * time.Millisecond)})
+					continue
+				}
+
 				job := Job{API: api, Seq: seq}
 
 				select {
 				case pending <- job:
+					if totalRounds > 0 {
+						log.Printf("[SCHED] queued api=%s seq=%d emitted=%d/%d", api.Name, seq, emitted+1, totalToEmit)
+					} else {
+						log.Printf("[SCHED] queued api=%s seq=%d", api.Name, seq)
+					}
+					if totalRounds > 0 {
+						emitted++
+						if emitted >= totalToEmit {
+							log.Printf("[SCHED] reached total rounds=%d (total messages=%d), stopping scheduler", totalRounds, totalToEmit)
+							if closePending != nil {
+								closePending()
+							}
+							return
+						}
+					}
 				case <-ctx.Done():
 					return
 				}
@@ -231,7 +359,6 @@ func schedulerGlobal(ctx context.Context, totalTPS float64, apis []API, pending 
 
 func dispatcher(ctx context.Context, client *http.Client, pending <-chan Job, sem chan struct{},
 	inFlightWG *sync.WaitGroup, cfg *Config) {
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -252,88 +379,67 @@ func dispatcher(ctx context.Context, client *http.Client, pending <-chan Job, se
 func startSend(ctx context.Context, job Job, client *http.Client, sem chan struct{},
 	inFlightWG *sync.WaitGroup, cfg *Config) {
 
-	select {
-	case sem <- struct{}{}:
-	case <-ctx.Done():
-		return
-	}
-
 	inFlightWG.Add(1)
-	metricInFlight.Inc()
 
 	go func(j Job) {
+		defer inFlightWG.Done()
+
+		// Acquire semaphore FIRST (before delay)
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
+
 		defer func() {
 			<-sem
-			inFlightWG.Done()
 			metricInFlight.Dec()
 		}()
 
+		metricInFlight.Inc()
+		// Single-attempt send (no retries)
 		rctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.Global.RequestTimeout)*time.Second)
 		defer cancel()
 
-		start := time.Now()
-		err := sendWithRetry(rctx, client, j, cfg.Global.MaxRetries, time.Duration(cfg.Global.BackoffMs)*time.Millisecond)
-		lat := time.Since(start).Seconds()
-
+		req, err := http.NewRequestWithContext(rctx, j.API.Method, j.API.URL, bytes.NewReader([]byte(j.API.Body)))
 		if err != nil {
 			metricFailed.WithLabelValues(j.API.Name).Inc()
 			log.Printf("[ERR] %s seq=%d err=%v\n", j.API.Name, j.Seq, err)
-		} else {
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		log.Printf("[SEND] time=%s api=%s seq=%d method=%s url=%s attempt=1",
+			time.Now().Format(time.RFC3339Nano), j.API.Name, j.Seq, j.API.Method, j.API.URL)
+
+		start := time.Now()
+		resp, err := client.Do(req)
+		lat := time.Since(start).Seconds()
+		if err != nil {
+			metricFailed.WithLabelValues(j.API.Name).Inc()
+			log.Printf("[ERR] %s seq=%d err=%v\n", j.API.Name, j.Seq, err)
+			return
+		}
+
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			metricSent.WithLabelValues(j.API.Name).Inc()
 			metricLatency.WithLabelValues(j.API.Name).Observe(lat)
+		} else {
+			metricFailed.WithLabelValues(j.API.Name).Inc()
+			log.Printf("[ERR] %s seq=%d status=%d\n", j.API.Name, j.Seq, resp.StatusCode)
 		}
 	}(job)
 }
 
-func sendWithRetry(ctx context.Context, client *http.Client, job Job,
-	maxAttempts int, backoffBase time.Duration) error {
-
-	var lastErr error
-
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-
-		req, err := http.NewRequestWithContext(ctx, job.API.Method, job.API.URL,
-			bytes.NewReader([]byte(job.API.Body)))
-		if err != nil {
-			return err
-		}
-
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := client.Do(req)
-		if err == nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				return nil
-			}
-			err = fmt.Errorf("status=%d", resp.StatusCode)
-		}
-
-		lastErr = err
-
-		if attempt < maxAttempts {
-			j := time.Duration(rand.Intn(100)) * time.Millisecond
-			sleep := backoffBase + j
-
-			select {
-			case <-time.After(sleep):
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-	}
-
-	return lastErr
-}
-
 func newHTTP2Client(maxIdlePerHost int, idleTimeout time.Duration) *http.Client {
 	tr := &http.Transport{
-		TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
+		TLSClientConfig: &tls.Config{
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: true, // Skip cert verification for self-signed certs
+		},
 		ForceAttemptHTTP2:   true,
 		MaxIdleConns:        10000,
 		MaxIdleConnsPerHost: maxIdlePerHost,

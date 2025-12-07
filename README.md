@@ -123,3 +123,14 @@ Send SIGINT/SIGTERM:
 ## License
 
 MIT
+
+
+
+
+# Terminal 1: Start the server
+cd /workspaces/http2loader/server
+./http_server -config=http_server_config.json -ports=3000 -ip=0.0.0.0
+
+# Terminal 2: Run the client
+cd /workspaces/http2loader
+./http2loader

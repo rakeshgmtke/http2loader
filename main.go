@@ -74,10 +74,13 @@ func printMetrics(stats *Stats, pending int, tps map[string]float64, avgLatency 
 	fmt.Fprintln(w, "--- Live Stats ---")
 	fmt.Fprintln(w, "API\tTPS\tSent\tResponses\t2xx\t3xx\t4xx\t5xx\tAvg Latency (ms)")
 
-	apiMetrics := stats.GetAPIMetrics()
-	for name, m := range apiMetrics {
+	// Use ordered metrics snapshot so UI shows APIs in configured order.
+	apiMetrics := stats.GetAPIMetricsOrdered()
+	for _, entry := range apiMetrics {
+		name := entry.Name
+		m := entry.Metric
 		fmt.Fprintf(w, "%s\t%.2f\t%d\t%d\t%d\t%d\t%d\t%d\t%.2f\n",
-			name, tps[name], m.Sent, m.TotalResponse, m.Success, m.Redirect, m.ClientError, m.ServerError, avgLatency[name]*1000)
+			name, tps[name], m.TotalSent, m.TotalResponse, m.Success, m.Redirect, m.ClientError, m.ServerError, avgLatency[name]*1000)
 	}
 
 	fmt.Fprintln(w, "--------------------")
@@ -223,28 +226,37 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				currentMetrics := stats.GetAPIMetrics()
-				currentTime := time.Now()
-				tps := make(map[string]float64)
-				avgLatency := make(map[string]float64)
+					// Use ordered snapshot to compute TPS and average latency in configured order.
+					ordered := stats.GetAPIMetricsOrdered()
+					currentTime := time.Now()
+					tps := make(map[string]float64)
+					avgLatency := make(map[string]float64)
 
-				if lastMetrics != nil {
-					duration := currentTime.Sub(lastTime).Seconds()
-					for name, m := range currentMetrics {
-						lastM, ok := lastMetrics[name]
-						if !ok {
-							continue
-						}
-						tps[name] = float64(m.TotalResponse-lastM.TotalResponse) / duration
-						if m.TotalResponse-lastM.TotalResponse > 0 {
-							avgLatency[name] = (m.TotalLatency - lastM.TotalLatency) / float64(m.TotalResponse-lastM.TotalResponse)
+					if lastMetrics != nil {
+						duration := currentTime.Sub(lastTime).Seconds()
+						for _, entry := range ordered {
+							name := entry.Name
+							m := entry.Metric
+							lastM, ok := lastMetrics[name]
+							if !ok {
+								continue
+							}
+							tps[name] = float64(m.TotalResponse-lastM.TotalResponse) / duration
+							if m.TotalResponse-lastM.TotalResponse > 0 {
+								avgLatency[name] = (m.TotalLatency - lastM.TotalLatency) / float64(m.TotalResponse-lastM.TotalResponse)
+							}
 						}
 					}
-				}
 
-				printMetrics(stats, len(pending), tps, avgLatency)
-				lastMetrics = currentMetrics
-				lastTime = currentTime
+					printMetrics(stats, len(pending), tps, avgLatency)
+
+					// Convert ordered snapshot into map for next iteration's diffing.
+					currentMetrics := make(map[string]APIMetric, len(ordered))
+					for _, entry := range ordered {
+						currentMetrics[entry.Name] = entry.Metric
+					}
+					lastMetrics = currentMetrics
+					lastTime = currentTime
 			}
 		}
 	}()
@@ -275,7 +287,7 @@ func loadConfig(path string) (*Config, error) {
 
 	// Defaults
 	if cfg.Global.TPS <= 0 {
-		cfg.Global.TPS = 100
+		cfg.Global.TPS = 1000
 	}
 	if cfg.Global.MaxInflight <= 0 {
 		cfg.Global.MaxInflight = 1000

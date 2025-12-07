@@ -96,14 +96,18 @@ var (
 		Name: "client_in_flight_requests",
 		Help: "Requests currently in-flight",
 	})
-	metricSent = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "client_requests_sent_total",
-		Help: "Total successful requests",
+	metricAttempted = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "client_requests_attempted_total",
+		Help: "Total requests attempted (sent to the network layer)",
+	}, []string{"api"})
+	metricSuccessful = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "client_responses_successful_total",
+		Help: "Total successful responses (2xx status)",
 	}, []string{"api"})
 	metricFailed = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "client_requests_failed_total",
-		Help: "Total failed requests",
-	}, []string{"api"})
+		Name: "client_responses_failed_total",
+		Help: "Total failed responses (3xx, 4xx, 5xx status)",
+	}, []string{"api", "status_class"})
 	metricLatency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "client_request_duration_seconds",
 		Help:    "Latency distribution",
@@ -112,7 +116,7 @@ var (
 )
 
 func init() {
-	prometheus.MustRegister(metricQueued, metricInFlight, metricSent, metricFailed, metricLatency)
+	prometheus.MustRegister(metricQueued, metricInFlight, metricAttempted, metricSuccessful, metricFailed, metricLatency)
 }
 
 func main() {
@@ -487,13 +491,14 @@ func startSend(ctx context.Context, job Job, client *http.Client, sem chan struc
 
 		metricInFlight.Inc()
 		atomic.AddInt64(&inFlight, 1)
+		metricAttempted.WithLabelValues(j.API.Name).Inc() // Increment attempted requests
 		// Single-attempt send (no retries)
 		rctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.Global.RequestTimeout)*time.Second)
 		defer cancel()
 
 		req, err := http.NewRequestWithContext(rctx, j.API.Method, j.API.URL, bytes.NewReader([]byte(j.API.Body)))
 		if err != nil {
-			metricFailed.WithLabelValues(j.API.Name).Inc()
+			metricFailed.WithLabelValues(j.API.Name, "client_error").Inc() // Label for request creation error
 			stats.IncClientError(j.API.Name) // Treat request creation errors as client errors
 			logrus.Errorf("[ERR] %s seq=%d err=%v\n", j.API.Name, j.Seq, err)
 			return
@@ -507,7 +512,7 @@ func startSend(ctx context.Context, job Job, client *http.Client, sem chan struc
 		resp, err := client.Do(req)
 		lat := time.Since(start).Seconds()
 		if err != nil {
-			metricFailed.WithLabelValues(j.API.Name).Inc()
+			metricFailed.WithLabelValues(j.API.Name, "transport_error").Inc() // Label for transport error
 			stats.IncClientError(j.API.Name) // Treat transport errors as client errors
 			logrus.Errorf("[ERR] %s seq=%d err=%v\n", j.API.Name, j.Seq, err)
 			return
@@ -522,16 +527,16 @@ func startSend(ctx context.Context, job Job, client *http.Client, sem chan struc
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			stats.IncSuccess(j.API.Name)
-			metricSent.WithLabelValues(j.API.Name).Inc()
+			metricSuccessful.WithLabelValues(j.API.Name).Inc() // Now uses metricSuccessful
 		} else if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 			stats.IncRedirect(j.API.Name)
-			metricFailed.WithLabelValues(j.API.Name).Inc()
+			metricFailed.WithLabelValues(j.API.Name, "3xx").Inc() // Label for 3xx
 		} else if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 			stats.IncClientError(j.API.Name)
-			metricFailed.WithLabelValues(j.API.Name).Inc()
+			metricFailed.WithLabelValues(j.API.Name, "4xx").Inc() // Label for 4xx
 		} else if resp.StatusCode >= 500 && resp.StatusCode < 600 {
 			stats.IncServerError(j.API.Name)
-			metricFailed.WithLabelValues(j.API.Name).Inc()
+			metricFailed.WithLabelValues(j.API.Name, "5xx").Inc() // Label for 5xx
 		}
 	}(job)
 }

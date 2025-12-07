@@ -6,7 +6,7 @@
     "request_timeout_seconds": 12,
     "max_retries": 2,
     "backoff_ms": 50,
-    "total_msg": 100000,
+    "total_msg": 1000,
     "max_idle_per_host": 200,
     "idle_conn_seconds": 90,
     "metrics_addr": ":9091",

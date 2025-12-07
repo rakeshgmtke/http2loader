@@ -71,10 +71,13 @@ var inFlight int64
 // printMetrics prints the statistics every second.
 func printMetrics(stats *Stats, pending int, tps map[string]float64, avgLatency map[string]float64) {
 	// Clear screen
+	now := time.Now()
+	timestamp := now.Format("15:04:05") // <---- NEW
+
 	fmt.Print("\033[H\033[2J")
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "--- Live Stats ---")
+	fmt.Fprintln(w, "--- Live Stats --- ", timestamp)
 	fmt.Fprintln(w, "API\tTPS\tSent\tResponses\t2xx\t3xx\t4xx\t5xx\tAvg Latency (ms)")
 
 	// Use ordered metrics snapshot so UI shows APIs in configured order.
@@ -334,8 +337,6 @@ func loadConfig(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-
-
 func scheduler(
 	ctx context.Context,
 	cfg *Config,
@@ -343,7 +344,8 @@ func scheduler(
 	closePending func(),
 ) {
 	apis := cfg.APIs
-	if len(apis) == 0 {
+	apiCount := len(apis)
+	if apiCount == 0 {
 		logrus.Error("[SCHED] no APIs configured — exiting scheduler")
 		if closePending != nil {
 			closePending()
@@ -351,149 +353,151 @@ func scheduler(
 		return
 	}
 
-	maxTPS := cfg.Global.TPS * float64(len(apis))
-	if maxTPS <= 0 {
-		logrus.Error("[SCHED] tps must be > 0 — exiting scheduler")
+	// TPS in config is PER API
+	perApiTPS := cfg.Global.TPS
+	if perApiTPS <= 0 {
+		logrus.Error("[SCHED] tps (per API) must be > 0 — exiting scheduler")
 		if closePending != nil {
 			closePending()
 		}
 		return
 	}
 
-	// total_msg is PER API → total = total_msg * number_of_APIs
-	totalPerAPI := cfg.Global.TotalMsg 
+	// Total messages = per-API total * number of APIs
+	totalPerAPI := cfg.Global.TotalMsg
 	totalMessages := 0
 	if totalPerAPI > 0 {
-		totalMessages = totalPerAPI * len(apis)
+		totalMessages = totalPerAPI * apiCount
 	}
 
-	rampPercent := cfg.Global.TpsRampPercent      // e.g. 10 means 10%
-	holdSeconds := cfg.Global.TpsRampHoldSeconds // seconds to hold each step
+	rampPercent := cfg.Global.TpsRampPercent      // e.g. 10 = 10%
+	holdSeconds := cfg.Global.TpsRampHoldSeconds // e.g. 2 seconds per step
+
+	apiIdx := 0
+	sent := 0
 
 	useRamp := rampPercent > 0 && holdSeconds > 0
 
-	// ---------------- FLAT TPS MODE ----------------
-	if !useRamp {
-		logrus.Infof(
-			"[SCHED] flat mode: tps=%.2f total_per_api=%d total_messages=%d",
-			maxTPS, totalPerAPI, totalMessages,
-		)
-
-		burst := int(maxTPS)
-		if burst < 1 {
-			burst = 1
+	// ---------------- RAMP PHASE (ONE-TIME) ----------------
+	if useRamp {
+		stepFraction := rampPercent / 100.0 // 10 → 0.10
+		if stepFraction <= 0 {
+			stepFraction = 0.10
 		}
-		limiter := rate.NewLimiter(rate.Limit(maxTPS), burst)
 
-		apiIdx := 0
-		sent := 0
+		// start from a fraction of per-API TPS
+		currentPerApiTPS := perApiTPS * stepFraction
+		if currentPerApiTPS < 1 {
+			currentPerApiTPS = 1
+		}
 
-		for {
-			// stop when we hit totalMessages (if configured)
-			if totalMessages > 0 && sent >= totalMessages {
-				logrus.Infof("[SCHED] done: sent %d messages, closing pending", sent)
-				if closePending != nil {
-					closePending()
+		for currentPerApiTPS < perApiTPS && (totalMessages == 0 || sent < totalMessages) {
+			currentGlobalTPS := currentPerApiTPS * float64(apiCount)
+
+			burst := int(currentGlobalTPS)
+			if burst < 1 {
+				burst = 1
+			}
+			limiter := rate.NewLimiter(rate.Limit(currentGlobalTPS), burst)
+
+			stepStart := time.Now()
+			stepEnd := stepStart.Add(time.Duration(holdSeconds) * time.Second)
+
+			logrus.Infof(
+				"[SCHED] ramp step: %.2f TPS/api (%.2f global) from %s to %s",
+				currentPerApiTPS,
+				currentGlobalTPS,
+				stepStart.Format(time.RFC3339),
+				stepEnd.Format(time.RFC3339),
+			)
+
+			// HOLD this TPS for exactly holdSeconds
+			for time.Now().Before(stepEnd) && (totalMessages == 0 || sent < totalMessages) {
+				if err := limiter.Wait(ctx); err != nil {
+					logrus.Warn("[SCHED] cancelled during ramp: ", err)
+					return
 				}
-				return
+
+				api := apis[apiIdx]
+				apiIdx = (apiIdx + 1) % apiCount
+
+				seq := atomic.AddInt64(&globalSeq, 1)
+
+				select {
+				case pending <- Job{API: api, Seq: seq}:
+					sent++
+					logrus.Debugf(
+						"[SCHED][RAMP] api=%s seq=%d sent=%d/%d tps/api=%.2f",
+						api.Name, seq, sent, totalMessages, currentPerApiTPS,
+					)
+				case <-ctx.Done():
+					logrus.Warn("[SCHED] context done during ramp")
+					if closePending != nil {
+						closePending()
+					}
+					return
+				}
 			}
 
-			if err := limiter.Wait(ctx); err != nil {
-				logrus.Warn("[SCHED] cancelled: ", err)
-				return
-			}
-
-			api := apis[apiIdx]
-			apiIdx = (apiIdx + 1) % len(apis)
-
-			seq := atomic.AddInt64(&globalSeq, 1)
-
-			select {
-			case pending <- Job{API: api, Seq: seq}:
-				sent++
-				logrus.Debugf(
-					"[SCHED] queued api=%s seq=%d sent=%d/%d (flat tps=%.2f)",
-					api.Name, seq, sent, totalMessages, maxTPS,
-				)
-			case <-ctx.Done():
-				logrus.Warn("[SCHED] context done — stopping scheduler")
-				return
+			// next ramp level
+			currentPerApiTPS += perApiTPS * stepFraction
+			if currentPerApiTPS > perApiTPS {
+				currentPerApiTPS = perApiTPS
 			}
 		}
 	}
 
-	// ---------------- RAMP-UP MODE ----------------
-	stepFraction := rampPercent / 100.0 // JSON 10 → 0.10
-	if stepFraction <= 0 {
-		stepFraction = 0.10 // default 10% if misconfigured
-	}
+	// ---------------- STEADY-STATE PHASE ----------------
 
-	currentTPS := maxTPS * stepFraction
-	if currentTPS < 1 {
-		currentTPS = 1
+	finalGlobalTPS := perApiTPS * float64(apiCount)
+	burst := int(finalGlobalTPS)
+	if burst < 1 {
+		burst = 1
 	}
+	limiter := rate.NewLimiter(rate.Limit(finalGlobalTPS), burst)
 
 	logrus.Infof(
-		"[SCHED] ramp mode: max_tps=%.2f step=%.2f%% hold=%ds total_per_api=%d total_messages=%d",
-		maxTPS, stepFraction*100, holdSeconds, totalPerAPI, totalMessages,
+		"[SCHED] steady state: %.2f TPS/api (%.2f global), total_per_api=%d total_messages=%d",
+		perApiTPS,
+		finalGlobalTPS,
+		totalPerAPI,
+		totalMessages,
 	)
 
-	sent := 0
-	apiIdx := 0
-
 	for totalMessages == 0 || sent < totalMessages {
-
-		burst := int(currentTPS)
-		if burst < 1 {
-			burst = 1
-		}
-		limiter := rate.NewLimiter(rate.Limit(currentTPS), burst)
-		stepEnd := time.Now().Add(time.Duration(holdSeconds) * time.Second)
-
-		logrus.Infof(
-			"[SCHED] step: tps=%.2f until %s",
-			currentTPS, stepEnd.Format(time.RFC3339),
-		)
-
-		for (totalMessages == 0 || sent < totalMessages) && time.Now().Before(stepEnd) {
-			if err := limiter.Wait(ctx); err != nil {
-				logrus.Warn("[SCHED] cancelled: ", err)
-				return
-			}
-
-			api := apis[apiIdx]
-			apiIdx = (apiIdx + 1) % len(apis)
-
-			seq := atomic.AddInt64(&globalSeq, 1)
-
-			select {
-			case pending <- Job{API: api, Seq: seq}:
-				sent++
-				logrus.Debugf(
-					"[SCHED] queued api=%s seq=%d sent=%d/%d (tps=%.2f)",
-					api.Name, seq, sent, totalMessages, currentTPS,
-				)
-			case <-ctx.Done():
-				logrus.Warn("[SCHED] context done — stopping scheduler")
-				if closePending != nil {
-					closePending()
-				}
-				return
-			}
+		if err := limiter.Wait(ctx); err != nil {
+			logrus.Warn("[SCHED] cancelled in steady state: ", err)
+			return
 		}
 
-		// next ramp step, but cap at maxTPS
-		currentTPS += maxTPS * stepFraction
-		if currentTPS > maxTPS {
-			currentTPS = maxTPS
+		api := apis[apiIdx]
+		apiIdx = (apiIdx + 1) % apiCount
+
+		seq := atomic.AddInt64(&globalSeq, 1)
+
+		select {
+		case pending <- Job{API: api, Seq: seq}:
+			sent++
+			logrus.Debugf(
+				"[SCHED][STEADY] api=%s seq=%d sent=%d/%d",
+				api.Name, seq, sent, totalMessages,
+			)
+		case <-ctx.Done():
+			logrus.Warn("[SCHED] context done in steady state")
+			if closePending != nil {
+				closePending()
+			}
+			return
 		}
 	}
 
-	logrus.Infof("[SCHED] done: sent %d messages, closing pending", sent)
+	logrus.Infof("[SCHED] completed sending %d messages — closing", sent)
 	if closePending != nil {
 		closePending()
 	}
 }
+
+
 
 /*func scheduler(ctx context.Context, totalTPS float64, apis []API, pending chan<- Job, totalRounds int, closePending func()) {
 	ticker := time.NewTicker(1 * time.Millisecond)

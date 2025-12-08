@@ -2,7 +2,7 @@
   "global": {
     "tps": 100,
     "tps_ramp_percent": 10,
-    "tps_ramp_hold_seconds": 2,
+    "tps_ramp_hold_seconds": 1,
     "max_inflight": 0,
     "pending_buf": 1000,
     "request_timeout_seconds": 12,

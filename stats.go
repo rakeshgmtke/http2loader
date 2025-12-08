@@ -38,14 +38,6 @@ func NewStats(apis []API) *Stats {
 	return s
 }
 
-// IncSent increments the sent counter for a given API.
-func (s *Stats) IncSent(apiName string) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if m, ok := s.APIMetrics[apiName]; ok {
-		atomic.AddUint64(&m.TotalSent, 1)
-	}
-}
 
 // IncSuccess increments the success counter for a given API.
 func (s *Stats) IncSuccess(apiName string) {

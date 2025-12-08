@@ -1,19 +1,25 @@
 {
-  "global": {
+  "server": {
+    "metrics_addr": ":9091",
+    "max_idle_per_host": 200,
+    "idle_conn_seconds": 90,
+    "log": {
+      "level": "info",
+      "format": "text",
+      "file": "http2loader.log",
+      "enable_stdout": true
+    }
+  },
+  "load": {
+    "total_msg": 100000,
     "tps": 100,
     "tps_ramp_percent": 10,
     "tps_ramp_hold_seconds": 1,
     "max_inflight": 100000,
     "pending_buf": 100000,
-    "request_timeout_seconds": 12,
-    "max_retries": 2,
-    "backoff_ms": 50,
-    "total_msg": 0,
-    "max_idle_per_host": 200,
-    "idle_conn_seconds": 90,
-    "metrics_addr": ":9091",
-    "log_level": "info"
+    "request_timeout_seconds": 12
   },
+  
   "apis": [
     {
       "name": "api1",
@@ -34,14 +40,14 @@
       "url": "http://localhost:3000/api/3",
       "method": "POST",
       "body": "{\"a\":3}",
-      "delay_ms": 15000
+      "delay_ms": 5000
     },
     {
       "name": "api4",
       "url": "http://localhost:3000/api/4",
       "method": "POST",
       "body": "{\"a\":4}",
-      "delay_ms": 20000
+      "delay_ms": 6000
     }
   ]
 }

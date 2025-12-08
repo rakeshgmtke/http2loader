@@ -8,9 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-
-	// "log" // Remove standard log package
-	//	"math"
 	"net/http"
 	"net/http/pprof"
 	"os"
@@ -30,33 +27,37 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// API describes a target endpoint (no TPS here — global TPS used)
+// ---------- Types ----------
+
 type API struct {
-	Name   string `json:"name"`
-	URL    string `json:"url"`
-	Method string `json:"method"`
-	Body   string `json:"body"`
-	// Delay in milliseconds to wait before dispatching this API's request.
-	DelayMs int `json:"delay_ms"`
+	Name    string `json:"name"`
+	URL     string `json:"url"`
+	Method  string `json:"method"`
+	Body    string `json:"body"`
+	DelayMs int    `json:"delay_ms"`
 }
 
-// Config defines configuration fields
 type Config struct {
-	Global struct {
-		TPS                float64 `json:"tps"`              // TPS per API (each API receives this rate)
-		TpsRampPercent     float64 `json:"tps_ramp_percent"` //
+	Server struct {
+		MetricsAddr    string `json:"metrics_addr"`
+		MaxIdlePerHost int    `json:"max_idle_per_host"`
+		IdleConnSec    int    `json:"idle_conn_seconds"`
+		Log            struct {
+			Level        string `json:"level"`
+			Format       string `json:"format"`
+			File         string `json:"file"`
+			EnableStdout bool   `json:"enable_stdout"`
+		} `json:"log"`
+	} `json:"server"`
+	Load struct {
+		TPS                float64 `json:"tps"`
+		TpsRampPercent     float64 `json:"tps_ramp_percent"`
 		TpsRampHoldSeconds int     `json:"tps_ramp_hold_seconds"`
 		MaxInflight        int     `json:"max_inflight"`
 		PendingBuf         int     `json:"pending_buf"`
 		RequestTimeout     int     `json:"request_timeout_seconds"`
-		MaxRetries         int     `json:"max_retries"`
-		BackoffMs          int     `json:"backoff_ms"`
-		MetricsAddr        string  `json:"metrics_addr"`
-
-		TotalMsg       int `json:"total_msg"` // Total number of messages to send across all APIs. If 0, scheduler runs indefinitely according to TPS.
-		MaxIdlePerHost int `json:"max_idle_per_host"`
-		IdleConnSec    int `json:"idle_conn_seconds"`
-	} `json:"global"`
+		TotalMsg           int     `json:"total_msg"` // now PER-API total
+	} `json:"load"`
 	APIs []API `json:"apis"`
 }
 
@@ -65,37 +66,11 @@ type Job struct {
 	Seq int64
 }
 
+// ---------- Globals ----------
+
 var globalSeq int64
 var inFlight int64
 
-// printMetrics prints the statistics every second.
-func printMetrics(stats *Stats, pending int, tps map[string]float64, avgLatency map[string]float64) {
-	// Clear screen
-	now := time.Now()
-	timestamp := now.Format("15:04:05") // <---- NEW
-
-	fmt.Print("\033[H\033[2J")
-
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "--- Live Stats --- ", timestamp)
-	fmt.Fprintln(w, "API\tTPS\tSent\tResponses\t2xx\t3xx\t4xx\t5xx\tAvg Latency (ms)")
-
-	// Use ordered metrics snapshot so UI shows APIs in configured order.
-	apiMetrics := stats.GetAPIMetricsOrdered()
-	for _, entry := range apiMetrics {
-		name := entry.Name
-		m := entry.Metric
-		fmt.Fprintf(w, "%s\t%.2f\t%d\t%d\t%d\t%d\t%d\t%d\t%.2f\n",
-			name, tps[name], m.TotalSent, m.TotalResponse, m.Success, m.Redirect, m.ClientError, m.ServerError, avgLatency[name]*1000)
-	}
-
-	fmt.Fprintln(w, "--------------------")
-	fmt.Fprintf(w, "Pending queue:\t%d\n", pending)
-	fmt.Fprintf(w, "In-flight:\t%d\n", atomic.LoadInt64(&inFlight))
-	w.Flush()
-}
-
-// Metrics
 var (
 	metricQueued = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "client_pending_queue_length",
@@ -128,46 +103,69 @@ func init() {
 	prometheus.MustRegister(metricQueued, metricInFlight, metricAttempted, metricSuccessful, metricFailed, metricLatency)
 }
 
+// ---------- main ----------
+
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to config.json")
-	logLevelStr := flag.String("log-level", "info", "log level (debug, info, warn, error)")
-	logFile := flag.String("log-file", "", "path to log file (e.g., app.log)")
+	logLevelFlag := flag.String("log-level", "", "log level override (debug, info, warn, error). If empty, config used.")
+	logFileFlag := flag.String("log-file", "", "log file path (overrides config file setting if provided)")
 	flag.Parse()
-
-	// Configure Logrus
-	logrus.SetFormatter(&logrus.TextFormatter{
-		FullTimestamp: true,
-	})
-	level, err := logrus.ParseLevel(*logLevelStr)
-	if err != nil {
-		logrus.Fatalf("invalid log level: %v", err)
-	}
-	logrus.SetLevel(level)
-
-	if *logFile != "" {
-		f, err := os.OpenFile(*logFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
-		if err != nil {
-			logrus.Fatalf("failed to open log file: %v", err)
-		}
-		mw := io.MultiWriter(os.Stdout, f)
-		logrus.SetOutput(mw)
-	} else {
-		logrus.SetOutput(os.Stdout)
-	}
 
 	cfg, err := loadConfig(*cfgPath)
 	if err != nil {
-		logrus.Fatalf("failed to load config: %v", err)
+		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
+		os.Exit(2)
+	}
+
+	// Logging setup
+	if cfg.Server.Log.Format == "json" {
+		logrus.SetFormatter(&logrus.JSONFormatter{TimestampFormat: time.RFC3339})
+	} else {
+		logrus.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
+	}
+
+	// Level: flag overrides config
+	levelStr := cfg.Server.Log.Level
+	if *logLevelFlag != "" {
+		levelStr = *logLevelFlag
+	}
+	if levelStr == "" {
+		levelStr = "info"
+	}
+	level, err := logrus.ParseLevel(levelStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid log level %q, using info\n", levelStr)
+		level = logrus.InfoLevel
+	}
+	logrus.SetLevel(level)
+
+	// Output: flag overrides config
+	logFile := cfg.Server.Log.File
+	if *logFileFlag != "" {
+		logFile = *logFileFlag
+	}
+	if logFile != "" {
+		f, err := os.OpenFile(logFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+		if err != nil {
+			logrus.Fatalf("failed to open log file: %v", err)
+		}
+		if cfg.Server.Log.EnableStdout {
+			logrus.SetOutput(io.MultiWriter(os.Stdout, f))
+		} else {
+			logrus.SetOutput(f)
+		}
+	} else {
+		logrus.SetOutput(os.Stdout)
 	}
 
 	if len(cfg.APIs) == 0 {
 		logrus.Fatalf("No APIs configured")
 	}
 
-	client := newHTTP2Client(cfg.Global.MaxIdlePerHost, time.Duration(cfg.Global.IdleConnSec)*time.Second)
+	client := newHTTP2Client(cfg.Server.MaxIdlePerHost, time.Duration(cfg.Server.IdleConnSec)*time.Second)
 
-	pending := make(chan Job, cfg.Global.PendingBuf)
-	sem := make(chan struct{}, cfg.Global.MaxInflight)
+	pending := make(chan Job, cfg.Load.PendingBuf)
+	sem := make(chan struct{}, cfg.Load.MaxInflight)
 	var inFlightWG sync.WaitGroup
 	var pendingCloser sync.Once
 	closePending := func() {
@@ -178,32 +176,36 @@ func main() {
 	defer cancel()
 	go waitForSig(cancel)
 
-	// Start metrics server with pprof
+	// Metrics & pprof
 	go func() {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", promhttp.Handler())
-		// Register pprof handlers properly using http package
-		mux.HandleFunc("/debug/pprof/", http.HandlerFunc(pprof.Index))
-		mux.HandleFunc("/debug/pprof/cmdline", http.HandlerFunc(pprof.Cmdline))
-		mux.HandleFunc("/debug/pprof/profile", http.HandlerFunc(pprof.Profile))
-		mux.HandleFunc("/debug/pprof/symbol", http.HandlerFunc(pprof.Symbol))
-		mux.HandleFunc("/debug/pprof/trace", http.HandlerFunc(pprof.Trace))
+
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 		mux.Handle("/debug/pprof/heap", pprof.Handler("heap"))
 		mux.Handle("/debug/pprof/goroutine", pprof.Handler("goroutine"))
 		mux.Handle("/debug/pprof/threadcreate", pprof.Handler("threadcreate"))
 		mux.Handle("/debug/pprof/block", pprof.Handler("block"))
 		mux.Handle("/debug/pprof/mutex", pprof.Handler("mutex"))
-		logrus.Infof("Metrics at %s/metrics, pprof at %s/debug/pprof/", cfg.Global.MetricsAddr, cfg.Global.MetricsAddr)
-		if err := http.ListenAndServe(cfg.Global.MetricsAddr, mux); err != nil {
+
+		addr := cfg.Server.MetricsAddr
+		if addr == "" {
+			addr = ":9090"
+		}
+		logrus.Infof("Metrics at %s/metrics, pprof at %s/debug/pprof/", addr, addr)
+		if err := http.ListenAndServe(addr, mux); err != nil {
 			logrus.Errorf("Metrics server error: %v", err)
 		}
 	}()
 
 	stats := NewStats(cfg.APIs)
-	// Scheduler (global TPS)
-	go scheduler(ctx, cfg, pending, closePending)
 
-	// Dispatcher
+	// Scheduler and dispatcher
+	go scheduler(ctx, cfg, pending, closePending)
 	go dispatcher(ctx, client, pending, sem, &inFlightWG, cfg, stats)
 
 	// Queue size updater
@@ -220,7 +222,7 @@ func main() {
 		}
 	}()
 
-	// Metrics printer
+	// Metrics TUI printer
 	go func() {
 		var lastMetrics map[string]APIMetric
 		var lastTime time.Time
@@ -232,7 +234,6 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				// Use ordered snapshot to compute TPS and average latency in configured order.
 				ordered := stats.GetAPIMetricsOrdered()
 				currentTime := time.Now()
 				tps := make(map[string]float64)
@@ -256,7 +257,6 @@ func main() {
 
 				printMetrics(stats, len(pending), tps, avgLatency)
 
-				// Convert ordered snapshot into map for next iteration's diffing.
 				currentMetrics := make(map[string]APIMetric, len(ordered))
 				for _, entry := range ordered {
 					currentMetrics[entry.Name] = entry.Metric
@@ -270,7 +270,6 @@ func main() {
 	<-ctx.Done()
 	logrus.Info("Shutdown requested — draining pending queue")
 
-	// Ensure pending is closed (scheduler may already have closed it)
 	closePending()
 	inFlightWG.Wait()
 
@@ -280,6 +279,8 @@ func main() {
 
 	logrus.Info("Exited cleanly")
 }
+
+// ---------- loadConfig ----------
 
 func loadConfig(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
@@ -291,52 +292,50 @@ func loadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 
-	// Defaults
-	if cfg.Global.TPS <= 0 {
-		cfg.Global.TPS = 1000
+	// server defaults
+	if cfg.Server.MetricsAddr == "" {
+		cfg.Server.MetricsAddr = ":9090"
+	}
+	if cfg.Server.MaxIdlePerHost <= 0 {
+		cfg.Server.MaxIdlePerHost = 200
+	}
+	if cfg.Server.IdleConnSec <= 0 {
+		cfg.Server.IdleConnSec = 90
+	}
+	if cfg.Server.Log.Format == "" {
+		cfg.Server.Log.Format = "text"
+	}
+	if cfg.Server.Log.Level == "" {
+		cfg.Server.Log.Level = "info"
 	}
 
-	stepFraction := cfg.Global.TpsRampPercent / 100.0
-	if stepFraction <= 0 {
-		stepFraction = 0.10 // default to 10% if 0 or negative
+	// load defaults
+	if cfg.Load.TPS <= 0 {
+		cfg.Load.TPS = 1000
 	}
-
-	if cfg.Global.TpsRampHoldSeconds <= 0 {
-		cfg.Global.TpsRampHoldSeconds = 1 // default to 1 seconds
+	if cfg.Load.TpsRampHoldSeconds <= 0 {
+		cfg.Load.TpsRampHoldSeconds = 1
 	}
-
-	if cfg.Global.MaxInflight <= 0 {
-		cfg.Global.MaxInflight = 1000
+	if cfg.Load.MaxInflight <= 0 {
+		cfg.Load.MaxInflight = 1000
 	}
-	if cfg.Global.PendingBuf <= 0 {
-		cfg.Global.PendingBuf = cfg.Global.MaxInflight * 2
+	if cfg.Load.PendingBuf <= 0 {
+		cfg.Load.PendingBuf = cfg.Load.MaxInflight * 2
 	}
-	if cfg.Global.RequestTimeout <= 0 {
-		cfg.Global.RequestTimeout = 15
+	if cfg.Load.RequestTimeout <= 0 {
+		cfg.Load.RequestTimeout = 15
 	}
-	if cfg.Global.MaxRetries < 0 {
-		cfg.Global.MaxRetries = 1
-	}
-	if cfg.Global.BackoffMs <= 0 {
-		cfg.Global.BackoffMs = 50
-	}
-	if cfg.Global.MetricsAddr == "" {
-		cfg.Global.MetricsAddr = ":9090"
-	}
-	if cfg.Global.MaxIdlePerHost <= 0 {
-		cfg.Global.MaxIdlePerHost = 200
-	}
-	if cfg.Global.IdleConnSec <= 0 {
-		cfg.Global.IdleConnSec = 90
-	}
-
-	if cfg.Global.TotalMsg < 0 {
-		cfg.Global.TotalMsg = 0
+	if cfg.Load.TotalMsg < 0 {
+		cfg.Load.TotalMsg = 0
 	}
 
 	return &cfg, nil
 }
 
+// scheduler: simple TPS-based scheduler (per-API TPS, per-API total_msg)
+// - cfg.Load.TPS is treated as per-API TPS
+// - cfg.Load.TotalMsg is treated as per-API total messages
+// - scheduler enqueues jobs in round-robin order and only enforces TPS
 func scheduler(
 	ctx context.Context,
 	cfg *Config,
@@ -353,8 +352,8 @@ func scheduler(
 		return
 	}
 
-	// TPS in config is PER API
-	perApiTPS := cfg.Global.TPS
+	// per-API TPS from config
+	perApiTPS := cfg.Load.TPS
 	if perApiTPS <= 0 {
 		logrus.Error("[SCHED] tps (per API) must be > 0 — exiting scheduler")
 		if closePending != nil {
@@ -363,29 +362,205 @@ func scheduler(
 		return
 	}
 
-	// Total messages = per-API total * number of APIs
-	totalPerAPI := cfg.Global.TotalMsg
+	// total messages per API from config; interpret as per-API total
+	totalPerAPI := cfg.Load.TotalMsg
+	if totalPerAPI < 0 {
+		totalPerAPI = 0
+	}
+
+	// total messages across all APIs (used for stopping)
 	totalMessages := 0
 	if totalPerAPI > 0 {
 		totalMessages = totalPerAPI * apiCount
 	}
 
-	rampPercent := cfg.Global.TpsRampPercent     // e.g. 10 = 10%
-	holdSeconds := cfg.Global.TpsRampHoldSeconds // e.g. 2 seconds per step
+	// ramp settings (unchanged semantics)
+	rampPercent := cfg.Load.TpsRampPercent
+	holdSeconds := cfg.Load.TpsRampHoldSeconds
+	useRamp := rampPercent > 0 && holdSeconds > 0
+
+	// Counters
+	sent := 0   // total jobs enqueued across all APIs
+	apiIdx := 0 // round-robin index
+
+	// Helper to check stop condition
+	reachedTotal := func() bool {
+		return totalMessages > 0 && sent >= totalMessages
+	}
+
+	// ---------------- RAMP PHASE ----------------
+	if useRamp {
+		stepFraction := rampPercent / 100.0
+		if stepFraction <= 0 {
+			stepFraction = 0.10
+		}
+
+		currentPerApiTPS := perApiTPS * stepFraction
+		if currentPerApiTPS < 1 {
+			currentPerApiTPS = 1
+		}
+
+		for currentPerApiTPS < perApiTPS && !reachedTotal() {
+			// compute global TPS for limiter (perApi * apiCount)
+			currentGlobalTPS := currentPerApiTPS * float64(apiCount)
+			if currentGlobalTPS <= 0 {
+				currentGlobalTPS = 1
+			}
+
+			/*burst := int(currentGlobalTPS)
+			if burst < 1 {
+				burst = 1
+			}*/
+			burst := apiCount
+			if burst < 1 {
+				burst = 1
+			}
+
+			limiter := rate.NewLimiter(rate.Limit(currentGlobalTPS), burst)
+
+			stepStart := time.Now()
+			stepEnd := stepStart.Add(time.Duration(holdSeconds) * time.Second)
+			logrus.Infof("[SCHED] ramp step: perApi=%.2f global=%.2f from %s to %s",
+				currentPerApiTPS, currentGlobalTPS, stepStart.Format(time.RFC3339), stepEnd.Format(time.RFC3339))
+
+			for time.Now().Before(stepEnd) && !reachedTotal() {
+				if err := limiter.Wait(ctx); err != nil {
+					logrus.Warn("[SCHED] cancelled during ramp: ", err)
+					if closePending != nil {
+						closePending()
+					}
+					return
+				}
+
+				api := apis[apiIdx]
+				apiIdx = (apiIdx + 1) % apiCount
+
+				seq := atomic.AddInt64(&globalSeq, 1)
+				select {
+				case pending <- Job{API: api, Seq: seq}:
+					sent++
+					// optional debug logging
+					if sent <= 10 || sent%1000 == 0 {
+						logrus.Debugf("[SCHED][RAMP] enqueued api=%s seq=%d sent=%d/%d", api.Name, seq, sent, totalMessages)
+					}
+				case <-ctx.Done():
+					logrus.Warn("[SCHED] context done during ramp")
+					if closePending != nil {
+						closePending()
+					}
+					return
+				}
+			}
+
+			currentPerApiTPS += perApiTPS * stepFraction
+			if currentPerApiTPS > perApiTPS {
+				currentPerApiTPS = perApiTPS
+			}
+		}
+	}
+
+	// ---------------- STEADY-STATE ----------------
+	finalGlobalTPS := perApiTPS * float64(apiCount)
+	if finalGlobalTPS <= 0 {
+		finalGlobalTPS = 1
+	}
+	/*burst := int(finalGlobalTPS)
+	if burst < 1 {
+		burst = 1
+	}*/
+	burst := apiCount
+	if burst < 1 {
+		burst = 1
+	}
+	limiter := rate.NewLimiter(rate.Limit(finalGlobalTPS), burst)
+
+	logrus.Infof("[SCHED] steady state: perApi=%.2f global=%.2f per_api_total=%d total_messages=%d",
+		perApiTPS, finalGlobalTPS, totalPerAPI, totalMessages)
+
+	for !reachedTotal() {
+		if err := limiter.Wait(ctx); err != nil {
+			logrus.Warn("[SCHED] cancelled in steady state: ", err)
+			if closePending != nil {
+				closePending()
+			}
+			return
+		}
+
+		api := apis[apiIdx]
+		apiIdx = (apiIdx + 1) % apiCount
+
+		seq := atomic.AddInt64(&globalSeq, 1)
+		select {
+		case pending <- Job{API: api, Seq: seq}:
+			sent++
+			if sent <= 10 || sent%1000 == 0 {
+				logrus.Debugf("[SCHED][STEADY] enqueued api=%s seq=%d sent=%d/%d", api.Name, seq, sent, totalMessages)
+			}
+		case <-ctx.Done():
+			logrus.Warn("[SCHED] context done in steady state")
+			if closePending != nil {
+				closePending()
+			}
+			return
+		}
+	}
+
+	logrus.Infof("[SCHED] completed sending %d messages (%d per API) — closing", totalMessages, totalPerAPI)
+	if closePending != nil {
+		closePending()
+	}
+}
+
+// ---------- scheduler ----------
+/*
+func scheduler(
+	ctx context.Context,
+	cfg *Config,
+	pending chan<- Job,
+	closePending func(),
+) {
+	apis := cfg.APIs
+	apiCount := len(apis)
+	if apiCount == 0 {
+		logrus.Error("[SCHED] no APIs configured — exiting scheduler")
+		if closePending != nil {
+			closePending()
+		}
+		return
+	}
+
+	// TPS is per-API
+	perApiTPS := cfg.Load.TPS
+	if perApiTPS <= 0 {
+		logrus.Error("[SCHED] tps (per API) must be > 0 — exiting scheduler")
+		if closePending != nil {
+			closePending()
+		}
+		return
+	}
+
+	// TOTAL messages = per-API total * number of APIs
+	totalPerAPI := cfg.Load.TotalMsg
+	totalMessages := 0
+	if totalPerAPI > 0 {
+		totalMessages = totalPerAPI * apiCount
+	}
+
+	rampPercent := cfg.Load.TpsRampPercent
+	holdSeconds := cfg.Load.TpsRampHoldSeconds
 
 	apiIdx := 0
 	sent := 0
 
 	useRamp := rampPercent > 0 && holdSeconds > 0
 
-	// ---------------- RAMP PHASE (ONE-TIME) ----------------
+	// ---------------- RAMP PHASE ----------------
 	if useRamp {
-		stepFraction := rampPercent / 100.0 // 10 → 0.10
+		stepFraction := rampPercent / 100.0
 		if stepFraction <= 0 {
 			stepFraction = 0.10
 		}
 
-		// start from a fraction of per-API TPS
 		currentPerApiTPS := perApiTPS * stepFraction
 		if currentPerApiTPS < 1 {
 			currentPerApiTPS = 1
@@ -411,7 +586,6 @@ func scheduler(
 				stepEnd.Format(time.RFC3339),
 			)
 
-			// HOLD this TPS for exactly holdSeconds
 			for time.Now().Before(stepEnd) && (totalMessages == 0 || sent < totalMessages) {
 				if err := limiter.Wait(ctx); err != nil {
 					logrus.Warn("[SCHED] cancelled during ramp: ", err)
@@ -439,7 +613,6 @@ func scheduler(
 				}
 			}
 
-			// next ramp level
 			currentPerApiTPS += perApiTPS * stepFraction
 			if currentPerApiTPS > perApiTPS {
 				currentPerApiTPS = perApiTPS
@@ -447,8 +620,7 @@ func scheduler(
 		}
 	}
 
-	// ---------------- STEADY-STATE PHASE ----------------
-
+	// ---------------- STEADY-STATE ----------------
 	finalGlobalTPS := perApiTPS * float64(apiCount)
 	burst := int(finalGlobalTPS)
 	if burst < 1 {
@@ -457,7 +629,7 @@ func scheduler(
 	limiter := rate.NewLimiter(rate.Limit(finalGlobalTPS), burst)
 
 	logrus.Infof(
-		"[SCHED] steady state: %.2f TPS/api (%.2f global), total_per_api=%d total_messages=%d",
+		"[SCHED] steady state: %.2f TPS/api (%.2f global), per_api_total=%d total_messages=%d",
 		perApiTPS,
 		finalGlobalTPS,
 		totalPerAPI,
@@ -491,153 +663,14 @@ func scheduler(
 		}
 	}
 
-	logrus.Infof("[SCHED] completed sending %d messages — closing", sent)
+	logrus.Infof("[SCHED] completed sending %d messages (per api=%d) — closing", sent, totalPerAPI)
 	if closePending != nil {
 		closePending()
 	}
 }
-
-/*
-	func scheduler(ctx context.Context, totalTPS float64, apis []API, pending chan<- Job, totalRounds int, closePending func()) {
-			ticker := time.NewTicker(1 * time.Millisecond)
-			defer ticker.Stop()
-
-			// Queue of delayed jobs (API, sequence, readyTime)
-			type delayedJob struct {
-				api   API
-				seq   int64
-				ready time.Time
-			}
-			delayedQueue := make([]delayedJob, 0, 100)
-
-			acc := 0.0
-			apiIdx := 0
-			count := len(apis)
-			var emitted int64
-			var totalToEmit int64
-			if totalRounds > 0 {
-				totalToEmit = int64(totalRounds) * int64(count)
-			}
-
-			// Emit an initial burst: round(TPS) jobs per second per API (burst across all APIs)
-			if totalTPS > 0 && count > 0 {
-				burstPerSec := int(math.Round(totalTPS))
-				burst := burstPerSec * count
-				for i := 0; i < burst; i++ {
-					api := apis[i%count]
-					seq := atomic.AddInt64(&globalSeq, 1)
-					if api.DelayMs > 0 {
-						delayedQueue = append(delayedQueue, delayedJob{api, seq, time.Now().Add(time.Duration(api.DelayMs) * time.Millisecond)})
-						continue
-					}
-					job := Job{API: api, Seq: seq}
-
-					select {
-					case pending <- job:
-						if totalRounds > 0 {
-							logrus.Debugf("[SCHED] queued api=%s seq=%d emitted=%d/%d", api.Name, seq, emitted+1, totalToEmit)
-						} else {
-							logrus.Debugf("[SCHED] queued api=%s seq=%d", api.Name, seq)
-						}
-						if totalRounds > 0 {
-							emitted++
-							if emitted >= totalToEmit {
-								logrus.Infof("[SCHED] reached total rounds=%d (total messages=%d), stopping scheduler", totalRounds, totalToEmit)
-								if closePending != nil {
-									closePending()
-								}
-								return
-							}
-						}
-					case <-ctx.Done():
-						return
-					}
-				}
-			}
-
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					now := time.Now()
-
-					// Process delayed queue: emit jobs whose delay has expired
-					var remaining []delayedJob
-					for _, dj := range delayedQueue {
-						if now.After(dj.ready) {
-							job := Job{API: dj.api, Seq: dj.seq}
-							select {
-							case pending <- job:
-								if totalRounds > 0 {
-									logrus.Debugf("[SCHED] queued api=%s seq=%d emitted=%d/%d (delayed)", dj.api.Name, dj.seq, emitted+1, totalToEmit)
-								}
-								if totalRounds > 0 {
-									emitted++
-									if emitted >= totalToEmit {
-										logrus.Infof("[SCHED] reached total rounds=%d (total messages=%d), stopping scheduler", totalRounds, totalToEmit)
-										if closePending != nil {
-											closePending()
-										}
-										return
-									}
-								}
-							case <-ctx.Done():
-								return
-							}
-						} else {
-							remaining = append(remaining, dj)
-						}
-					}
-					delayedQueue = remaining
-
-					// totalTPS is now interpreted as per-API TPS, scale by number of APIs
-					acc += (totalTPS * float64(count)) / 1000.0
-					toEmit := int(math.Floor(acc))
-					if toEmit <= 0 {
-						continue
-					}
-					acc -= float64(toEmit)
-
-					for i := 0; i < toEmit; i++ {
-						api := apis[apiIdx]
-						apiIdx = (apiIdx + 1) % count
-
-						seq := atomic.AddInt64(&globalSeq, 1)
-
-						// Queue delayed jobs separately
-						if api.DelayMs > 0 {
-							delayedQueue = append(delayedQueue, delayedJob{api, seq, now.Add(time.Duration(api.DelayMs) * time.Millisecond)})
-							continue
-						}
-
-						job := Job{API: api, Seq: seq}
-
-						select {
-						case pending <- job:
-							if totalRounds > 0 {
-								logrus.Debugf("[SCHED] queued api=%s seq=%d emitted=%d/%d", api.Name, seq, emitted+1, totalToEmit)
-							} else {
-								logrus.Debugf("[SCHED] queued api=%s seq=%d", api.Name, seq)
-							}
-							if totalRounds > 0 {
-								emitted++
-								if emitted >= totalToEmit {
-									logrus.Infof("[SCHED] reached total rounds=%d (total messages=%d), stopping scheduler", totalRounds, totalToEmit)
-									if closePending != nil {
-										closePending()
-									}
-									return
-								}
-							}
-						case <-ctx.Done():
-							return
-						}
-					}
-				}
-			}
-		}
 */
+// ---------- dispatcher & send ----------
+
 func dispatcher(ctx context.Context, client *http.Client, pending <-chan Job, sem chan struct{},
 	inFlightWG *sync.WaitGroup, cfg *Config, stats *Stats) {
 	for {
@@ -680,7 +713,7 @@ func startSend(ctx context.Context, job Job, client *http.Client, sem chan struc
 
 		metricInFlight.Inc()
 		atomic.AddInt64(&inFlight, 1)
-		metricAttempted.WithLabelValues(j.API.Name).Inc() // Increment attempted requests
+		metricAttempted.WithLabelValues(j.API.Name).Inc()
 
 		// Apply delay before dispatching the request
 		if j.API.DelayMs > 0 {
@@ -688,13 +721,13 @@ func startSend(ctx context.Context, job Job, client *http.Client, sem chan struc
 		}
 
 		// Single-attempt send (no retries)
-		rctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.Global.RequestTimeout)*time.Second)
+		rctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.Load.RequestTimeout)*time.Second)
 		defer cancel()
 
 		req, err := http.NewRequestWithContext(rctx, j.API.Method, j.API.URL, bytes.NewReader([]byte(j.API.Body)))
 		if err != nil {
-			metricFailed.WithLabelValues(j.API.Name, "client_error").Inc() // Label for request creation error
-			stats.IncClientError(j.API.Name)                               // Treat request creation errors as client errors
+			metricFailed.WithLabelValues(j.API.Name, "client_error").Inc()
+			stats.IncClientError(j.API.Name)
 			logrus.Errorf("[ERR] %s seq=%d err=%v\n", j.API.Name, j.Seq, err)
 			return
 		}
@@ -708,8 +741,8 @@ func startSend(ctx context.Context, job Job, client *http.Client, sem chan struc
 		stats.IncTotalSent(j.API.Name)
 		lat := time.Since(start).Seconds()
 		if err != nil {
-			metricFailed.WithLabelValues(j.API.Name, "transport_error").Inc() // Label for transport error
-			stats.IncClientError(j.API.Name)                                  // Treat transport errors as client errors
+			metricFailed.WithLabelValues(j.API.Name, "transport_error").Inc()
+			stats.IncClientError(j.API.Name)
 			logrus.Errorf("[ERR] %s seq=%d err=%v\n", j.API.Name, j.Seq, err)
 			return
 		}
@@ -723,25 +756,27 @@ func startSend(ctx context.Context, job Job, client *http.Client, sem chan struc
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			stats.IncSuccess(j.API.Name)
-			metricSuccessful.WithLabelValues(j.API.Name).Inc() // Now uses metricSuccessful
+			metricSuccessful.WithLabelValues(j.API.Name).Inc()
 		} else if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 			stats.IncRedirect(j.API.Name)
-			metricFailed.WithLabelValues(j.API.Name, "3xx").Inc() // Label for 3xx
+			metricFailed.WithLabelValues(j.API.Name, "3xx").Inc()
 		} else if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 			stats.IncClientError(j.API.Name)
-			metricFailed.WithLabelValues(j.API.Name, "4xx").Inc() // Label for 4xx
+			metricFailed.WithLabelValues(j.API.Name, "4xx").Inc()
 		} else if resp.StatusCode >= 500 && resp.StatusCode < 600 {
 			stats.IncServerError(j.API.Name)
-			metricFailed.WithLabelValues(j.API.Name, "5xx").Inc() // Label for 5xx
+			metricFailed.WithLabelValues(j.API.Name, "5xx").Inc()
 		}
 	}(job)
 }
+
+// ---------- HTTP2 client ----------
 
 func newHTTP2Client(maxIdlePerHost int, idleTimeout time.Duration) *http.Client {
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{
 			MinVersion:         tls.VersionTLS12,
-			InsecureSkipVerify: true, // Skip cert verification for self-signed certs
+			InsecureSkipVerify: true, // kept original behavior
 		},
 		ForceAttemptHTTP2:   true,
 		MaxIdleConns:        10000,
@@ -750,6 +785,31 @@ func newHTTP2Client(maxIdlePerHost int, idleTimeout time.Duration) *http.Client 
 	}
 	_ = http2.ConfigureTransport(tr)
 	return &http.Client{Transport: tr, Timeout: 0}
+}
+
+// ---------- utils ----------
+
+func printMetrics(stats *Stats, pending int, tps map[string]float64, avgLatency map[string]float64) {
+	now := time.Now()
+	timestamp := now.Format("15:04:05")
+	fmt.Print("\033[H\033[2J")
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "--- Live Stats --- ", timestamp)
+	fmt.Fprintln(w, "API\tTPS\tSent\tResponses\t2xx\t3xx\t4xx\t5xx\tAvg Latency (ms)")
+
+	apiMetrics := stats.GetAPIMetricsOrdered()
+	for _, entry := range apiMetrics {
+		name := entry.Name
+		m := entry.Metric
+		fmt.Fprintf(w, "%s\t%.2f\t%d\t%d\t%d\t%d\t%d\t%d\t%.2f\n",
+			name, tps[name], m.TotalSent, m.TotalResponse, m.Success, m.Redirect, m.ClientError, m.ServerError, avgLatency[name]*1000)
+	}
+
+	fmt.Fprintln(w, "--------------------")
+	fmt.Fprintf(w, "Pending queue:\t%d\n", pending)
+	fmt.Fprintf(w, "In-flight:\t%d\n", atomic.LoadInt64(&inFlight))
+	w.Flush()
 }
 
 func waitForSig(cancel func()) {

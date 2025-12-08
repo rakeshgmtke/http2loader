@@ -10,7 +10,7 @@ import (
 	"io"
 
 	// "log" // Remove standard log package
-//	"math"
+	//	"math"
 	"net/http"
 	"net/http/pprof"
 	"os"
@@ -43,16 +43,16 @@ type API struct {
 // Config defines configuration fields
 type Config struct {
 	Global struct {
-		TPS            float64 `json:"tps"` // TPS per API (each API receives this rate)
+		TPS                float64 `json:"tps"`              // TPS per API (each API receives this rate)
 		TpsRampPercent     float64 `json:"tps_ramp_percent"` //
 		TpsRampHoldSeconds int     `json:"tps_ramp_hold_seconds"`
-		MaxInflight    int     `json:"max_inflight"`
-		PendingBuf     int     `json:"pending_buf"`
-		RequestTimeout int     `json:"request_timeout_seconds"`
-		MaxRetries     int     `json:"max_retries"`
-		BackoffMs      int     `json:"backoff_ms"`
-		MetricsAddr    string  `json:"metrics_addr"`
-		
+		MaxInflight        int     `json:"max_inflight"`
+		PendingBuf         int     `json:"pending_buf"`
+		RequestTimeout     int     `json:"request_timeout_seconds"`
+		MaxRetries         int     `json:"max_retries"`
+		BackoffMs          int     `json:"backoff_ms"`
+		MetricsAddr        string  `json:"metrics_addr"`
+
 		TotalMsg       int `json:"total_msg"` // Total number of messages to send across all APIs. If 0, scheduler runs indefinitely according to TPS.
 		MaxIdlePerHost int `json:"max_idle_per_host"`
 		IdleConnSec    int `json:"idle_conn_seconds"`
@@ -303,8 +303,8 @@ func loadConfig(path string) (*Config, error) {
 
 	if cfg.Global.TpsRampHoldSeconds <= 0 {
 		cfg.Global.TpsRampHoldSeconds = 1 // default to 1 seconds
-	}	
-	
+	}
+
 	if cfg.Global.MaxInflight <= 0 {
 		cfg.Global.MaxInflight = 1000
 	}
@@ -370,7 +370,7 @@ func scheduler(
 		totalMessages = totalPerAPI * apiCount
 	}
 
-	rampPercent := cfg.Global.TpsRampPercent      // e.g. 10 = 10%
+	rampPercent := cfg.Global.TpsRampPercent     // e.g. 10 = 10%
 	holdSeconds := cfg.Global.TpsRampHoldSeconds // e.g. 2 seconds per step
 
 	apiIdx := 0
@@ -497,81 +497,47 @@ func scheduler(
 	}
 }
 
+/*
+	func scheduler(ctx context.Context, totalTPS float64, apis []API, pending chan<- Job, totalRounds int, closePending func()) {
+			ticker := time.NewTicker(1 * time.Millisecond)
+			defer ticker.Stop()
 
-
-/*func scheduler(ctx context.Context, totalTPS float64, apis []API, pending chan<- Job, totalRounds int, closePending func()) {
-	ticker := time.NewTicker(1 * time.Millisecond)
-	defer ticker.Stop()
-
-	// Queue of delayed jobs (API, sequence, readyTime)
-	type delayedJob struct {
-		api   API
-		seq   int64
-		ready time.Time
-	}
-	delayedQueue := make([]delayedJob, 0, 100)
-
-	acc := 0.0
-	apiIdx := 0
-	count := len(apis)
-	var emitted int64
-	var totalToEmit int64
-	if totalRounds > 0 {
-		totalToEmit = int64(totalRounds) * int64(count)
-	}
-
-	// Emit an initial burst: round(TPS) jobs per second per API (burst across all APIs)
-	if totalTPS > 0 && count > 0 {
-		burstPerSec := int(math.Round(totalTPS))
-		burst := burstPerSec * count
-		for i := 0; i < burst; i++ {
-			api := apis[i%count]
-			seq := atomic.AddInt64(&globalSeq, 1)
-			if api.DelayMs > 0 {
-				delayedQueue = append(delayedQueue, delayedJob{api, seq, time.Now().Add(time.Duration(api.DelayMs) * time.Millisecond)})
-				continue
+			// Queue of delayed jobs (API, sequence, readyTime)
+			type delayedJob struct {
+				api   API
+				seq   int64
+				ready time.Time
 			}
-			job := Job{API: api, Seq: seq}
+			delayedQueue := make([]delayedJob, 0, 100)
 
-			select {
-			case pending <- job:
-				if totalRounds > 0 {
-					logrus.Debugf("[SCHED] queued api=%s seq=%d emitted=%d/%d", api.Name, seq, emitted+1, totalToEmit)
-				} else {
-					logrus.Debugf("[SCHED] queued api=%s seq=%d", api.Name, seq)
-				}
-				if totalRounds > 0 {
-					emitted++
-					if emitted >= totalToEmit {
-						logrus.Infof("[SCHED] reached total rounds=%d (total messages=%d), stopping scheduler", totalRounds, totalToEmit)
-						if closePending != nil {
-							closePending()
-						}
-						return
+			acc := 0.0
+			apiIdx := 0
+			count := len(apis)
+			var emitted int64
+			var totalToEmit int64
+			if totalRounds > 0 {
+				totalToEmit = int64(totalRounds) * int64(count)
+			}
+
+			// Emit an initial burst: round(TPS) jobs per second per API (burst across all APIs)
+			if totalTPS > 0 && count > 0 {
+				burstPerSec := int(math.Round(totalTPS))
+				burst := burstPerSec * count
+				for i := 0; i < burst; i++ {
+					api := apis[i%count]
+					seq := atomic.AddInt64(&globalSeq, 1)
+					if api.DelayMs > 0 {
+						delayedQueue = append(delayedQueue, delayedJob{api, seq, time.Now().Add(time.Duration(api.DelayMs) * time.Millisecond)})
+						continue
 					}
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}
+					job := Job{API: api, Seq: seq}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			now := time.Now()
-
-			// Process delayed queue: emit jobs whose delay has expired
-			var remaining []delayedJob
-			for _, dj := range delayedQueue {
-				if now.After(dj.ready) {
-					job := Job{API: dj.api, Seq: dj.seq}
 					select {
 					case pending <- job:
 						if totalRounds > 0 {
-							logrus.Debugf("[SCHED] queued api=%s seq=%d emitted=%d/%d (delayed)", dj.api.Name, dj.seq, emitted+1, totalToEmit)
+							logrus.Debugf("[SCHED] queued api=%s seq=%d emitted=%d/%d", api.Name, seq, emitted+1, totalToEmit)
+						} else {
+							logrus.Debugf("[SCHED] queued api=%s seq=%d", api.Name, seq)
 						}
 						if totalRounds > 0 {
 							emitted++
@@ -586,58 +552,91 @@ func scheduler(
 					case <-ctx.Done():
 						return
 					}
-				} else {
-					remaining = append(remaining, dj)
 				}
 			}
-			delayedQueue = remaining
 
-			// totalTPS is now interpreted as per-API TPS, scale by number of APIs
-			acc += (totalTPS * float64(count)) / 1000.0
-			toEmit := int(math.Floor(acc))
-			if toEmit <= 0 {
-				continue
-			}
-			acc -= float64(toEmit)
-
-			for i := 0; i < toEmit; i++ {
-				api := apis[apiIdx]
-				apiIdx = (apiIdx + 1) % count
-
-				seq := atomic.AddInt64(&globalSeq, 1)
-
-				// Queue delayed jobs separately
-				if api.DelayMs > 0 {
-					delayedQueue = append(delayedQueue, delayedJob{api, seq, now.Add(time.Duration(api.DelayMs) * time.Millisecond)})
-					continue
-				}
-
-				job := Job{API: api, Seq: seq}
-
+			for {
 				select {
-				case pending <- job:
-					if totalRounds > 0 {
-						logrus.Debugf("[SCHED] queued api=%s seq=%d emitted=%d/%d", api.Name, seq, emitted+1, totalToEmit)
-					} else {
-						logrus.Debugf("[SCHED] queued api=%s seq=%d", api.Name, seq)
-					}
-					if totalRounds > 0 {
-						emitted++
-						if emitted >= totalToEmit {
-							logrus.Infof("[SCHED] reached total rounds=%d (total messages=%d), stopping scheduler", totalRounds, totalToEmit)
-							if closePending != nil {
-								closePending()
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					now := time.Now()
+
+					// Process delayed queue: emit jobs whose delay has expired
+					var remaining []delayedJob
+					for _, dj := range delayedQueue {
+						if now.After(dj.ready) {
+							job := Job{API: dj.api, Seq: dj.seq}
+							select {
+							case pending <- job:
+								if totalRounds > 0 {
+									logrus.Debugf("[SCHED] queued api=%s seq=%d emitted=%d/%d (delayed)", dj.api.Name, dj.seq, emitted+1, totalToEmit)
+								}
+								if totalRounds > 0 {
+									emitted++
+									if emitted >= totalToEmit {
+										logrus.Infof("[SCHED] reached total rounds=%d (total messages=%d), stopping scheduler", totalRounds, totalToEmit)
+										if closePending != nil {
+											closePending()
+										}
+										return
+									}
+								}
+							case <-ctx.Done():
+								return
 							}
+						} else {
+							remaining = append(remaining, dj)
+						}
+					}
+					delayedQueue = remaining
+
+					// totalTPS is now interpreted as per-API TPS, scale by number of APIs
+					acc += (totalTPS * float64(count)) / 1000.0
+					toEmit := int(math.Floor(acc))
+					if toEmit <= 0 {
+						continue
+					}
+					acc -= float64(toEmit)
+
+					for i := 0; i < toEmit; i++ {
+						api := apis[apiIdx]
+						apiIdx = (apiIdx + 1) % count
+
+						seq := atomic.AddInt64(&globalSeq, 1)
+
+						// Queue delayed jobs separately
+						if api.DelayMs > 0 {
+							delayedQueue = append(delayedQueue, delayedJob{api, seq, now.Add(time.Duration(api.DelayMs) * time.Millisecond)})
+							continue
+						}
+
+						job := Job{API: api, Seq: seq}
+
+						select {
+						case pending <- job:
+							if totalRounds > 0 {
+								logrus.Debugf("[SCHED] queued api=%s seq=%d emitted=%d/%d", api.Name, seq, emitted+1, totalToEmit)
+							} else {
+								logrus.Debugf("[SCHED] queued api=%s seq=%d", api.Name, seq)
+							}
+							if totalRounds > 0 {
+								emitted++
+								if emitted >= totalToEmit {
+									logrus.Infof("[SCHED] reached total rounds=%d (total messages=%d), stopping scheduler", totalRounds, totalToEmit)
+									if closePending != nil {
+										closePending()
+									}
+									return
+								}
+							}
+						case <-ctx.Done():
 							return
 						}
 					}
-				case <-ctx.Done():
-					return
 				}
 			}
 		}
-	}
-}
 */
 func dispatcher(ctx context.Context, client *http.Client, pending <-chan Job, sem chan struct{},
 	inFlightWG *sync.WaitGroup, cfg *Config, stats *Stats) {
@@ -682,6 +681,12 @@ func startSend(ctx context.Context, job Job, client *http.Client, sem chan struc
 		metricInFlight.Inc()
 		atomic.AddInt64(&inFlight, 1)
 		metricAttempted.WithLabelValues(j.API.Name).Inc() // Increment attempted requests
+
+		// Apply delay before dispatching the request
+		if j.API.DelayMs > 0 {
+			time.Sleep(time.Duration(j.API.DelayMs) * time.Millisecond)
+		}
+
 		// Single-attempt send (no retries)
 		rctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.Global.RequestTimeout)*time.Second)
 		defer cancel()

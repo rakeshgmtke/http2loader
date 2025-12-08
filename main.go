@@ -25,19 +25,13 @@ import (
 	"text/tabwriter"
 	"time"
 
-	dto "github.com/prometheus/client_model/go"
-
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-
+	dto "github.com/prometheus/client_model/go"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
 	"golang.org/x/time/rate"
 )
-
-// This main.go is a version that avoids raw-mode single-key reads and
-// screen-clearing redrawing to ensure it works in VS Code / GitHub workspaces.
-// Keep stats.go (your Stats implementation) unchanged and in the same package.
 
 // ---------------- Types & Config ----------------
 
@@ -83,8 +77,10 @@ type Job struct {
 	Seq int64
 }
 
-var globalSeq int64
-var inFlight int64
+var (
+	globalSeq int64
+	inFlight  int64
+)
 
 // ---------------- Prometheus metrics ----------------
 
@@ -151,7 +147,7 @@ func newHTTP2Client(maxIdle, maxConns int, idleTimeout time.Duration) *http.Clie
 		DialContext:         dialer.DialContext,
 	}
 	_ = http2.ConfigureTransport(tr)
-	return &http.Client{Transport: tr, Timeout: 0}
+	return &http.Client{Transport: tr}
 }
 
 // ---------------- Helpers ----------------
@@ -220,17 +216,8 @@ var showHostStatsFlag int32 = 1
 var pausedFlag int32 = 0
 var currentPerApiTPS atomic.Value // stores float64
 
-// lineModeListener: unified REPL for VSCode / non-TTY terminals.
-// Commands:
-//
-//	h               - show this help
-//	s               - toggle host stats (showHostStatsFlag)
-//	p               - pause/resume scheduler
-//	+               - increase per-API TPS by 10
-//	-               - decrease per-API TPS by 10 (min 1)
-//	tps <n>         - set per-API TPS to n (e.g., "tps 10")
-//	tps +<n> / tps -<n> - relative adjust (e.g., "tps +10")
-//	q               - quit
+// ---------------- Line-mode REPL ----------------
+
 func lineModeListener(ctx context.Context, cancel func()) {
 	r := bufio.NewReader(os.Stdin)
 	printHelp := func() {
@@ -262,29 +249,23 @@ func lineModeListener(ctx context.Context, cancel func()) {
 			if line == "" {
 				continue
 			}
-
-			// Split tokens
 			parts := strings.Fields(line)
 			cmd := strings.ToLower(parts[0])
 
 			switch cmd {
 			case "h":
 				printHelp()
-
 			case "s":
 				atomic.StoreInt32(&showHostStatsFlag, 1-atomic.LoadInt32(&showHostStatsFlag))
 				fmt.Fprintf(os.Stderr, "[KEY] HostStats -> %v\n", atomic.LoadInt32(&showHostStatsFlag) == 1)
-
 			case "p":
 				atomic.StoreInt32(&pausedFlag, 1-atomic.LoadInt32(&pausedFlag))
 				fmt.Fprintf(os.Stderr, "[KEY] Paused -> %v\n", atomic.LoadInt32(&pausedFlag) == 1)
-
 			case "+":
 				v := currentPerApiTPS.Load().(float64)
 				v += 10.0
 				currentPerApiTPS.Store(v)
 				fmt.Fprintf(os.Stderr, "[KEY] TPS -> %.2f per API\n", v)
-
 			case "-":
 				v := currentPerApiTPS.Load().(float64)
 				v -= 10.0
@@ -293,7 +274,6 @@ func lineModeListener(ctx context.Context, cancel func()) {
 				}
 				currentPerApiTPS.Store(v)
 				fmt.Fprintf(os.Stderr, "[KEY] TPS -> %.2f per API\n", v)
-
 			case "tps":
 				if len(parts) < 2 {
 					fmt.Fprintln(os.Stderr, "[ERR] usage: tps <n> | tps +<n> | tps -<n>")
@@ -301,7 +281,6 @@ func lineModeListener(ctx context.Context, cancel func()) {
 				}
 				arg := parts[1]
 				if strings.HasPrefix(arg, "+") || strings.HasPrefix(arg, "-") {
-					// relative adjust
 					d, err := strconv.ParseFloat(arg, 64)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "[ERR] invalid tps delta: %v\n", err)
@@ -315,7 +294,6 @@ func lineModeListener(ctx context.Context, cancel func()) {
 					currentPerApiTPS.Store(v)
 					fmt.Fprintf(os.Stderr, "[KEY] TPS adjusted -> %.2f per API\n", v)
 				} else {
-					// absolute set
 					n, err := strconv.ParseFloat(arg, 64)
 					if err != nil || n <= 0 {
 						fmt.Fprintf(os.Stderr, "[ERR] invalid tps value: %v\n", err)
@@ -324,12 +302,10 @@ func lineModeListener(ctx context.Context, cancel func()) {
 					currentPerApiTPS.Store(n)
 					fmt.Fprintf(os.Stderr, "[KEY] TPS set -> %.2f per API\n", n)
 				}
-
 			case "q":
 				fmt.Fprintln(os.Stderr, "[KEY] Quit requested")
 				cancel()
 				return
-
 			default:
 				fmt.Fprintf(os.Stderr, "[ERR] unknown command: %s. Type 'h' for help\n", cmd)
 			}
@@ -362,21 +338,22 @@ func collectHostStats(cfg *Config, pool *ClientPool) map[string]HostConnStats {
 		numClients = 1
 	}
 	for h := range hostSet {
-		out[h] = HostConnStats{Active: numClients, Idle: 0, InUse: 0, MaxIdle: cfg.Server.MaxIdlePerHost, MaxConns: 1}
+		out[h] = HostConnStats{Active: numClients, Idle: 0, InUse: 0, MaxIdle: cfg.Server.MaxIdlePerHost, MaxConns: cfg.Server.MaxConnsPerHost}
 	}
 	return out
 }
 
-// ---------------- Metrics printer (no screen clear) ----------------
+// ---------------- Metrics printer ----------------
 
 func printMetricsSimple(stats *Stats, pending int, tps map[string]float64, cfg *Config, pool *ClientPool) {
 	ordered := stats.GetAPIMetricsOrdered()
 	var totalSent, totalResp, total2xx, totalErr uint64
 	for _, e := range ordered {
-		totalSent += e.Metric.TotalSent
-		totalResp += e.Metric.TotalResponse
-		total2xx += e.Metric.Success
-		totalErr += e.Metric.Redirect + e.Metric.ClientError + e.Metric.ServerError
+		m := e.Metric
+		totalSent += m.TotalSent
+		totalResp += m.TotalResponse
+		total2xx += m.Success
+		totalErr += m.Redirect + m.ClientError + m.ServerError
 	}
 
 	var ms runtime.MemStats
@@ -387,14 +364,13 @@ func printMetricsSimple(stats *Stats, pending int, tps map[string]float64, cfg *
 	perApiTps := currentPerApiTPS.Load().(float64)
 	targetGlobal := perApiTps * float64(apiCount)
 
-	// one tabwriter per block (keeps alignment within block)
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 
 	fmt.Fprintf(w, "---- http2loader Live Stats @ %s UTC ----\n", now)
+	fmt.Fprintln(w, "[KEYS] h=help | q=quit | p=pause | s=hoststats | +=TPS+10 | -=TPS-10 | tps <n>=set TPS")
+	fmt.Fprintln(w)
+
 	fmt.Fprintf(w, "CFG:\tTPS=%.2f/API\tTotalMsg=%d/API\tAPIs=%d\tTargetGlobalTPS=%.2f\n", perApiTps, cfg.Load.TotalMsg, apiCount, targetGlobal)
-
-	fmt.Println("[KEYS] h=help | q=quit | p=pause | s=hoststats | +=TPS+10 | -=TPS-10 | tps <n>=set TPS")
-
 	hostStats := collectHostStats(cfg, pool)
 	fmt.Fprintf(w, "TCP:\tExpectedConns=%d\tClients=%d\tHosts=%d\tPending=%d\tInFlight=%d\n",
 		cfg.Server.Connum*len(hostStats), cfg.Server.Connum, len(hostStats), pending, atomic.LoadInt64(&inFlight))
@@ -414,19 +390,26 @@ func printMetricsSimple(stats *Stats, pending int, tps map[string]float64, cfg *
 		m := e.Metric
 		name := e.Name
 		t := tps[name]
-		inF := int64(m.TotalSent) - int64(m.TotalResponse)
-		if inF < 0 {
-			inF = 0
-		}
-		avgMs, maxMs, _ := getAvgAndMaxFromHistogram(name)
-		if avgMs == 0 && m.TotalResponse > 0 {
+		inF := int64(m.InFlight)
+		avgMs := 0.0
+		if m.TotalResponse > 0 {
 			avgMs = (m.TotalLatency / float64(m.TotalResponse)) * 1000.0
 		}
-		if maxMs == 0 {
-			maxMs = m.MaxLatency * 1000.0
+		maxMs := m.MaxLatency * 1000.0
+
+		// If histogram has values, prefer histogram-derived avg & approx max
+		hAvg, hMax, _ := getAvgAndMaxFromHistogram(name)
+		if hAvg > 0 {
+			avgMs = hAvg
 		}
+		if hMax > 0 {
+			maxMs = hMax
+		}
+
 		fmt.Fprintf(w, "%s\t%.2f\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%.2f\t%.2f\n",
-			name, t, m.TotalSent, m.TotalResponse, m.Success, m.Redirect, m.ClientError, m.ServerError, inF, avgMs, maxMs)
+			name, t, m.TotalSent, m.TotalResponse,
+			m.Success, m.Redirect, m.ClientError, m.ServerError,
+			inF, avgMs, maxMs)
 	}
 	fmt.Fprintln(w, "--------------------------------------------------------------------------------\n")
 	w.Flush()
@@ -528,33 +511,42 @@ func dispatcher(ctx context.Context, pool *ClientPool, pending <-chan Job, sem c
 	}
 }
 
-func startSend(ctx context.Context, pool *ClientPool, j Job, sem chan struct{},
-	wg *sync.WaitGroup, cfg *Config, stats *Stats) {
+func startSend(ctx context.Context, pool *ClientPool, job Job, sem chan struct{},
+	inFlightWG *sync.WaitGroup, cfg *Config, stats *Stats) {
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	inFlightWG.Add(1)
 
+	go func(j Job) {
+		defer inFlightWG.Done()
+
+		// Acquire semaphore FIRST (before delay)
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():
 			return
 		}
+
+		// Increment per-API in-flight + global in-flight + prom metric
+		stats.IncInFlight(j.API.Name)
+		atomic.AddInt64(&inFlight, 1)
+		metricInFlight.Inc()
+
+		// Ensure release and decrement in any exit path
 		defer func() {
 			<-sem
 			metricInFlight.Dec()
 			atomic.AddInt64(&inFlight, -1)
+			stats.DecInFlight(j.API.Name)
 		}()
 
-		client := pool.Next()
-		metricInFlight.Inc()
-		atomic.AddInt64(&inFlight, 1)
 		metricAttempted.WithLabelValues(j.API.Name).Inc()
 
+		// API-level delay
 		if j.API.DelayMs > 0 {
 			time.Sleep(time.Duration(j.API.DelayMs) * time.Millisecond)
 		}
 
+		// request timeout
 		rctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.Load.RequestTimeout)*time.Second)
 		defer cancel()
 
@@ -568,9 +560,10 @@ func startSend(ctx context.Context, pool *ClientPool, j Job, sem chan struct{},
 		req.Header.Set("Content-Type", "application/json")
 
 		start := time.Now()
-		resp, err := client.Do(req)
+		resp, err := pool.Next().Do(req)
 		stats.IncTotalSent(j.API.Name)
 		lat := time.Since(start).Seconds()
+
 		if err != nil {
 			metricFailed.WithLabelValues(j.API.Name, "transport_error").Inc()
 			stats.IncClientError(j.API.Name)
@@ -598,7 +591,7 @@ func startSend(ctx context.Context, pool *ClientPool, j Job, sem chan struct{},
 			stats.IncServerError(j.API.Name)
 			metricFailed.WithLabelValues(j.API.Name, "5xx").Inc()
 		}
-	}()
+	}(job)
 }
 
 // ---------------- Main ----------------
@@ -618,7 +611,7 @@ func main() {
 		currentPerApiTPS.Store(1.0)
 	}
 
-	// logging -> stderr
+	// logging
 	if cfg.Server.Log.Format == "json" {
 		logrus.SetFormatter(&logrus.JSONFormatter{TimestampFormat: time.RFC3339})
 	} else {
@@ -641,34 +634,39 @@ func main() {
 	}
 
 	if len(cfg.APIs) == 0 {
-		logrus.Fatalf("no APIs configured")
+		logrus.Fatalf("No APIs configured")
 	}
 
+	// client pool
 	connum := cfg.Server.Connum
 	if connum <= 0 {
 		connum = 1
 	}
 	clients := make([]*http.Client, 0, connum)
 	for i := 0; i < connum; i++ {
-		clients = append(clients, newHTTP2Client(cfg.Server.MaxIdlePerHost, 1, time.Duration(cfg.Server.IdleConnSec)*time.Second))
+		clients = append(clients, newHTTP2Client(cfg.Server.MaxIdlePerHost, cfg.Server.MaxConnsPerHost, time.Duration(cfg.Server.IdleConnSec)*time.Second))
 	}
 	pool := NewClientPool(clients)
+	logrus.Infof("ClientPool created: %d clients", connum)
 
 	// metrics server
 	go func() {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", promhttp.Handler())
 		mux.HandleFunc("/debug/pprof/", http.HandlerFunc(pprof.Index))
+		mux.HandleFunc("/debug/pprof/profile", http.HandlerFunc(pprof.Profile))
+
 		addr := cfg.Server.MetricsAddr
 		if addr == "" {
 			addr = ":9090"
 		}
 		logrus.Infof("Metrics at %s/metrics", addr)
 		if err := http.ListenAndServe(addr, mux); err != nil {
-			logrus.Errorf("metrics server error: %v", err)
+			logrus.Errorf("Metrics server error: %v", err)
 		}
 	}()
 
+	// pending queue & semaphore
 	pending := make(chan Job, cfg.Load.PendingBuf)
 	sem := make(chan struct{}, cfg.Load.MaxInflight)
 	var wg sync.WaitGroup
@@ -678,7 +676,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// keyboard: line-mode (works in VSCode / Workspace)
+	// keyboard REPL
 	go lineModeListener(ctx, cancel)
 
 	// signal handler
@@ -690,8 +688,8 @@ func main() {
 		cancel()
 	}()
 
+	// stats + run
 	stats := NewStats(cfg.APIs)
-
 	go dynamicScheduler(ctx, cfg, pending, closePending)
 	go dispatcher(ctx, pool, pending, sem, &wg, cfg, stats)
 
@@ -709,7 +707,7 @@ func main() {
 		}
 	}()
 
-	// UI printer (no full-screen redraws)
+	// UI printer
 	go func() {
 		var last map[string]APIMetric
 		var lastT time.Time
@@ -723,24 +721,27 @@ func main() {
 				ordered := stats.GetAPIMetricsOrdered()
 				now := time.Now()
 				tps := make(map[string]float64)
+
 				if last != nil {
-					dur := now.Sub(lastT).Seconds()
-					if dur <= 0 {
-						dur = 1
+					d := now.Sub(lastT).Seconds()
+					if d <= 0 {
+						d = 1
 					}
 					for _, e := range ordered {
 						name := e.Name
 						if prev, ok := last[name]; ok {
-							tps[name] = float64(e.Metric.TotalResponse-prev.TotalResponse) / dur
+							tps[name] = float64(e.Metric.TotalResponse-prev.TotalResponse) / d
 						}
 					}
 				}
+
 				cur := make(map[string]APIMetric)
 				for _, e := range ordered {
 					cur[e.Name] = e.Metric
 				}
 				last = cur
 				lastT = now
+
 				printMetricsSimple(stats, len(pending), tps, cfg, pool)
 			}
 		}

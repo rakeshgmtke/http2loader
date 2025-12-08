@@ -3,8 +3,6 @@
     "metrics_addr": ":9091",
     "max_idle_per_host": 200,
     "idle_conn_seconds": 90,
-    "max_conns_per_host": 10,
-    "connum": 10,
     "log": {
       "level": "info",
       "format": "text",
@@ -13,7 +11,7 @@
     }
   },
   "load": {
-    "total_msg": 100000,
+    "total_msg": 1000,
     "tps": 100,
     "tps_ramp_percent": 10,
     "tps_ramp_hold_seconds": 1,
@@ -21,7 +19,26 @@
     "pending_buf": 100000,
     "request_timeout_seconds": 12
   },
-  
+  "ranges": {
+    "msisdn": {
+      "prefix": "9845",
+      "suffix_start": "000000",
+      "suffix_end": "099999",
+      "wrap": false
+    },
+    "supi": {
+      "prefix": "1234567890",
+      "suffix_start": "0000",
+      "suffix_end": "9999",
+      "wrap": true
+    },
+    "sipuri": {
+      "prefix": "sip:+91",
+      "suffix_start": "7000000000",
+      "suffix_end": "7000099999",
+      "wrap": true
+    }
+  },
   "apis": [
     {
       "name": "api1",

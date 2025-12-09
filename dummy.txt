@@ -42,21 +42,21 @@
   "apis": [
     {
       "name": "api1",
-      "url": "http://localhost:3000/api/1",
+      "url": "http://localhost:3000/{$supi}/api/1",
       "method": "POST",
       "body": "{\"a\":1}",
       "delay_ms": 0
     },
     {
       "name": "api2",
-      "url": "http://localhost:3000/api/2",
+      "url": "http://localhost:3000/{$msisdn}/api/2",
       "method": "POST",
       "body": "{\"a\":2}",
       "delay_ms": 1000
     },
     {
       "name": "api3",
-      "url": "http://localhost:3000/api/3",
+      "url": "http://localhost:3000/{$sipuri}/api/3",
       "method": "POST",
       "body": "{\"a\":3}",
       "delay_ms": 5000

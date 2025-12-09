@@ -1,20 +1,22 @@
 {
   "server": {
     "metrics_addr": ":9090",
-  "max_idle_per_host": 10,
-  "idle_conn_seconds": 30,
-  "max_conns_per_host": 10,
+    "max_idle_per_host": 10,
+    "idle_conn_seconds": 30,
+    "max_conns_per_host": 10,
     "connum": 10,
     "log": {
-      "level": "info",
+      "level": "debug",
       "format": "text",
       "file": "http2loader.log",
-      "enable_stdout": true
+      "enable_stdout": false,
+      "rotate_max_size_mb": 50,
+      "rotate_max_backups": 5
     }
   },
   "load": {
-    "total_msg": 100000,
-    "tps": 1000,
+    "total_msg": 10000,
+    "tps": 10,
     "tps_ramp_percent": 10,
     "tps_ramp_hold_seconds": 1,
     "max_inflight": 100000,
@@ -22,33 +24,60 @@
     "request_timeout_seconds": 12
   },
   
+  "ranges": {
+    "supi": {
+      "prefix": "supi-",
+      "template": "45005????"
+    },
+    "sipuri": {
+      "prefix": "sip:+91",  
+      "template": "70000?????"
+    }
+  },
+
   "apis": [
     {
       "name": "api1",
-      "url": "http://localhost:3000/api/1",
+      "url": "http://localhost:3000/{$supi}/api/1",
       "method": "POST",
-      "body": "{\"a\":1}",
+      "headers": {
+        "X-Header": "{$sipuri}",
+        "Content-Type": "application/json"
+      },       
+      "body": "{\"a\":{$sipuri}}",
       "delay_ms": 0
     },
     {
       "name": "api2",
-      "url": "http://localhost:3000/api/2",
+      "url": "http://localhost:3001/{$supi}/api/2",
       "method": "POST",
-      "body": "{\"a\":2}",
+      "headers": {
+        "X-Header": "{$sipuri}",
+        "Content-Type": "application/json"
+      },  
+      "body": "{\"a\":{$sipuri}}",
       "delay_ms": 1000
     },
     {
       "name": "api3",
-      "url": "http://localhost:3000/api/3",
+      "url": "http://localhost:3002/{$supi}/api/3",
       "method": "POST",
+      "headers": {
+        "X-Header": "{$sipuri}",
+        "Content-Type": "application/json"
+      },        
       "body": "{\"a\":3}",
       "delay_ms": 5000
     },
     {
       "name": "api4",
-      "url": "http://localhost:3000/api/4",
+      "url": "http://localhost:3003/{$supi}/api/4",
       "method": "POST",
-      "body": "{\"a\":4}",
+      "headers": {
+        "X-Header": "{$sipuri}",
+        "Content-Type": "application/json"
+      },        
+      "body": "{\"a\":{$sipuri}}",
       "delay_ms": 6000
     }
   ]

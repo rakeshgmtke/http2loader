@@ -766,7 +766,7 @@ func dynamicScheduler(ctx context.Context, cfg *Config, pending chan<- Job, clos
 			if globalRate < 1.0 {
 				globalRate = 1.0
 			}
-			limiter = rate.NewLimiter(rate.Limit(globalRate), apiCount)
+			limiter = rate.NewLimiter(rate.Limit(desired), apiCount)
 			applied = desired
 			logrus.Infof("[SCHED] perAPI=%.2f global=%.2f", desired, globalRate)
 		}

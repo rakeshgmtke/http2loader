@@ -828,7 +828,11 @@ func dynamicScheduler(ctx context.Context, cfg *Config, pending chan<- Job, clos
 		}
 
 		round++
-		time.Sleep(1 * time.Millisecond)
+
+		//this will improve scheduler accuracy under high load.
+		//time.Sleep(1 * time.Millisecond)
+		time.Sleep(1 * time.Nanosecond)
+
 		if totalMessages > 0 && sent >= totalMessages {
 			break
 		}
